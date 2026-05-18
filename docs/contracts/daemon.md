@@ -8,7 +8,7 @@ governs:
   - "packages/core/src/ingest.ts"
   - "packages/core/src/extract/index.ts"
   - "packages/core/src/persist.ts"
-adr: [ADR-049, ADR-063, ADR-048, ADR-026, ADR-027, ADR-071]
+adr: [ADR-049, ADR-063, ADR-048, ADR-026, ADR-027, ADR-071, ADR-072]
 ---
 
 # Daemon contract
@@ -61,11 +61,17 @@ The OTLP/gRPC receiver on `:4317` stays opt-in via `NEAT_OTLP_GRPC=true` per the
 
 Spans route to a project by `service.name` lookup across registered projects. Spans for unknown services route to a fallback `'default'` project for FrontierNode auto-creation per ADR-033.
 
+`routeSpanToProject(serviceName, projects)` matches in three passes (ADR-072):
+
+1. **Exact** — `entry.name === serviceName`.
+2. **Token prefix** — `entry.name` is the first hyphen/underscore-separated token of `serviceName`. `brief` matches `brief-api`, `brief_worker`; `briefcase` does not match `brief`. Longest project name wins (so `brief-api` outranks `brief` when both are registered and the span says `brief-api-staging`).
+3. **Token containment** — `entry.name` appears as a separator-delimited token inside `serviceName`. `api` matches `brief-api-staging` only when no prefix match was found.
+
 Routing eligibility by status:
 
-- `active` matches by `service.name` (steady state).
-- `broken` also matches by name. The router selects the broken slot so the ingest-time recovery path (below) can attempt a single re-bootstrap before the span is dropped. If recovery fails, the span is dropped with a rate-limited warning that points at `neatd reload`.
-- `paused` never matches — the operator paused the project on purpose. The span falls through to the `default` project's FrontierNode flow.
+- `active` matches by `service.name` at every pass (steady state).
+- `broken` also matches at every pass. The router selects the broken slot so the ingest-time recovery path (below) can attempt a single re-bootstrap before the span is dropped. If recovery fails, the span is dropped with a rate-limited warning that points at `neatd reload`.
+- `paused` never matches — the operator paused the project on purpose. The span falls through to the `default` project's FrontierNode flow per ADR-033.
 
 ## Ingest-time recovery for broken projects (ADR-071)
 
