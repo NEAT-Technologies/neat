@@ -31,6 +31,8 @@ import {
   TRANSITIVE_DEPENDENCIES_MAX_DEPTH,
 } from './traverse.js'
 import { computeGraphDiff, loadSnapshotForDiff } from './diff.js'
+import { mergeSnapshot } from './ingest.js'
+import { SCHEMA_VERSION, type PersistedGraph } from './persist.js'
 import type { SearchIndex } from './search.js'
 import type { Projects, ProjectContext } from './projects.js'
 import { Projects as ProjectsClass, pathsForProject } from './projects.js'
@@ -60,6 +62,10 @@ export interface BuildApiOptions {
   // ADR-073 §3 — when the operator runs behind a reverse proxy that already
   // authenticates the request, the daemon-side check is bypassed.
   trustProxy?: boolean
+  // ADR-073 §3 amendment — public-read mode. When `true`, GET / HEAD / OPTIONS
+  // bypass the bearer check; writes still require it. OTLP ingest is gated
+  // independently and is unaffected by this flag.
+  publicRead?: boolean
 }
 
 interface SerializedGraph {
@@ -434,6 +440,46 @@ function registerRoutes(scope: FastifyInstance, ctx: RouteContext): void {
     },
   )
 
+  // Snapshot push (ADR-074 §1). `neat sync` POSTs a snapshot here; we merge
+  // it into the live graph through `mergeSnapshot`, which preserves any
+  // accumulated OBSERVED edges per the Rule 2 coexistence contract. Body
+  // shape is the same JSON `persist.ts` writes to disk. Dual-mounted at
+  // `/snapshot` and `/projects/:project/snapshot` via registerRoutes.
+  scope.post<{
+    Params: { project?: string }
+    Body: { snapshot?: PersistedGraph }
+  }>('/snapshot', async (req, reply) => {
+    const proj = resolveProject(registry, req, reply)
+    if (!proj) return
+    const body = req.body
+    if (!body || typeof body !== 'object' || !body.snapshot) {
+      return reply
+        .code(400)
+        .send({ error: 'request body must be { snapshot: <persisted-graph> }' })
+    }
+    const snap = body.snapshot
+    if (typeof snap.schemaVersion !== 'number' || snap.schemaVersion !== SCHEMA_VERSION) {
+      return reply.code(400).send({
+        error: `unsupported snapshot schemaVersion ${snap.schemaVersion} (expected ${SCHEMA_VERSION})`,
+      })
+    }
+    try {
+      const result = mergeSnapshot(proj.graph, snap)
+      return {
+        project: proj.name,
+        nodesAdded: result.nodesAdded,
+        edgesAdded: result.edgesAdded,
+        nodeCount: proj.graph.order,
+        edgeCount: proj.graph.size,
+      }
+    } catch (err) {
+      return reply.code(400).send({
+        error: 'snapshot merge failed',
+        details: (err as Error).message,
+      })
+    }
+  })
+
   scope.post<{ Params: { project?: string } }>('/graph/scan', async (req, reply) => {
     const proj = resolveProject(registry, req, reply)
     if (!proj) return
@@ -557,8 +603,22 @@ export async function buildApi(opts: BuildApiOptions): Promise<FastifyInstance> 
 
   // ADR-073 §3 — bearer middleware sits ahead of every route handler. No-op
   // when `authToken` is undefined; loopback-only callers (the laptop dev
-  // path) hit that branch.
-  mountBearerAuth(app, { token: opts.authToken, trustProxy: opts.trustProxy })
+  // path) hit that branch. `publicRead` opens GET / HEAD / OPTIONS to
+  // anonymous callers while keeping writes gated.
+  mountBearerAuth(app, {
+    token: opts.authToken,
+    trustProxy: opts.trustProxy,
+    publicRead: opts.publicRead,
+  })
+
+  // ADR-073 §3 amendment — `/api/config` is always unauthenticated. The web
+  // shell hits it before any bearer-carrying request to learn which mode the
+  // daemon is in. Exposes exactly two booleans — `publicRead` and
+  // `authProxy` — and nothing else; no project list, no version, no env.
+  app.get('/api/config', async () => ({
+    publicRead: opts.publicRead === true,
+    authProxy: opts.trustProxy === true,
+  }))
 
   const startedAt = opts.startedAt ?? Date.now()
   const registry = buildLegacyRegistry(opts)

@@ -71,6 +71,82 @@ export interface OrchestratorResult {
   }
 }
 
+// Shared sub-pipeline `neat sync` re-uses (ADR-074 §1). Discovery + extract
+// + snapshot write. Distinct from the first-run-only steps (registry add,
+// daemon spawn, browser open, summary block) that the orchestrator owns
+// directly.
+export interface ExtractAndPersistOptions {
+  scanPath: string
+  project: string
+  projectExplicit: boolean
+  // When true, skip persisting to disk — for `neat sync --dry-run`.
+  dryRun?: boolean
+}
+
+export interface ExtractAndPersistResult {
+  graph: ReturnType<typeof getGraph>
+  graphKey: string
+  services: Awaited<ReturnType<typeof discoverServices>>
+  languages: string[]
+  nodesAdded: number
+  edgesAdded: number
+  snapshotPath: string
+  errorsPath: string
+}
+
+export async function extractAndPersist(
+  opts: ExtractAndPersistOptions,
+): Promise<ExtractAndPersistResult> {
+  const services = await discoverServices(opts.scanPath)
+  const languages = [...new Set(services.map((s) => s.node.language))].sort()
+
+  const graphKey = opts.projectExplicit ? opts.project : DEFAULT_PROJECT
+  resetGraph(graphKey)
+  const graph = getGraph(graphKey)
+  const projectPaths = pathsForProject(graphKey, path.join(opts.scanPath, 'neat-out'))
+  const extraction = await extractFromDirectory(graph, opts.scanPath, {
+    errorsPath: projectPaths.errorsPath,
+  })
+  if (!opts.dryRun) {
+    await saveGraphToDisk(graph, projectPaths.snapshotPath)
+  }
+  return {
+    graph,
+    graphKey,
+    services,
+    languages,
+    nodesAdded: extraction.nodesAdded,
+    edgesAdded: extraction.edgesAdded,
+    snapshotPath: projectPaths.snapshotPath,
+    errorsPath: projectPaths.errorsPath,
+  }
+}
+
+// SDK-install apply over a discovered service list. Returns the same shape
+// the orchestrator's result.steps.apply uses so callers (orchestrator + sync)
+// share the rollup logic.
+export async function applyInstallersOver(
+  services: Awaited<ReturnType<typeof discoverServices>>,
+): Promise<{ instrumented: number; alreadyInstrumented: number; libOnly: number }> {
+  let instrumented = 0
+  let already = 0
+  let libOnly = 0
+  for (const svc of services) {
+    const installer = await pickInstaller(svc.dir)
+    if (!installer) continue
+    const plan: InstallPlan = await installer.plan(svc.dir)
+    if (isEmptyPlan(plan) && !plan.libOnly) {
+      already++
+      continue
+    }
+    const outcome = await installer.apply(plan)
+    if (outcome.outcome === 'instrumented') instrumented++
+    else if (outcome.outcome === 'already-instrumented') already++
+    else if (outcome.outcome === 'lib-only') libOnly++
+  }
+  return { instrumented, alreadyInstrumented: already, libOnly }
+}
+
 async function promptYesNo(question: string): Promise<boolean> {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout })
   return new Promise((resolve) => {
@@ -190,9 +266,14 @@ export async function runOrchestrator(opts: OrchestratorOptions): Promise<Orches
   console.log(`neat: ${opts.scanPath}`)
   console.log('')
 
-  // ── Step 1: discovery ─────────────────────────────────────────────────
-  const services = await discoverServices(opts.scanPath)
-  const languages = [...new Set(services.map((s) => s.node.language))].sort()
+  // ── Step 1: discovery, Step 2: extraction + snapshot ─────────────────
+  // Shared with `neat sync` (ADR-074 §1) via extractAndPersist.
+  const persisted = await extractAndPersist({
+    scanPath: opts.scanPath,
+    project: opts.project,
+    projectExplicit: opts.projectExplicit,
+  })
+  const { graph, services, languages } = persisted
   result.steps.discovery = { services: services.length, languages }
   console.log(`discovered ${services.length} service(s) across ${languages.length} language(s)`)
 
@@ -202,17 +283,9 @@ export async function runOrchestrator(opts: OrchestratorOptions): Promise<Orches
     runApply = await promptYesNo('instrument your services and open the dashboard?')
   }
 
-  // ── Step 2: extraction + snapshot + gitignore + register ─────────────
-  const graphKey = opts.projectExplicit ? opts.project : DEFAULT_PROJECT
-  resetGraph(graphKey)
-  const graph = getGraph(graphKey)
-  const projectPaths = pathsForProject(graphKey, path.join(opts.scanPath, 'neat-out'))
-  const errorsPath = projectPaths.errorsPath
-  const extraction = await extractFromDirectory(graph, opts.scanPath, { errorsPath })
-  await saveGraphToDisk(graph, projectPaths.snapshotPath)
   result.steps.extraction = {
-    nodesAdded: extraction.nodesAdded,
-    edgesAdded: extraction.edgesAdded,
+    nodesAdded: persisted.nodesAdded,
+    edgesAdded: persisted.edgesAdded,
   }
 
   const gi = await ensureNeatOutIgnored(opts.scanPath)
@@ -243,24 +316,11 @@ export async function runOrchestrator(opts: OrchestratorOptions): Promise<Orches
     result.steps.apply.skipped = true
     console.log('skipped instrumentation (--no-instrument)')
   } else {
-    let instrumented = 0
-    let already = 0
-    let libOnly = 0
-    for (const svc of services) {
-      const installer = await pickInstaller(svc.dir)
-      if (!installer) continue
-      const plan: InstallPlan = await installer.plan(svc.dir)
-      if (isEmptyPlan(plan) && !plan.libOnly) {
-        already++
-        continue
-      }
-      const outcome = await installer.apply(plan)
-      if (outcome.outcome === 'instrumented') instrumented++
-      else if (outcome.outcome === 'already-instrumented') already++
-      else if (outcome.outcome === 'lib-only') libOnly++
-    }
-    result.steps.apply = { instrumented, alreadyInstrumented: already, libOnly, skipped: false }
-    console.log(`instrumented ${instrumented}, already ${already}, lib-only ${libOnly}`)
+    const tally = await applyInstallersOver(services)
+    result.steps.apply = { ...tally, skipped: false }
+    console.log(
+      `instrumented ${tally.instrumented}, already ${tally.alreadyInstrumented}, lib-only ${tally.libOnly}`,
+    )
   }
 
   // ── Step 4: daemon spawn + health poll ───────────────────────────────

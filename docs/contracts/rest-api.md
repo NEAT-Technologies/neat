@@ -47,6 +47,7 @@ Bare arrays from REST endpoints are a contract violation. Why: an object can gro
 | `GET /policies/violations?severity=X&policyId=X` | current violations, filterable | `{ violations: PolicyViolation[] }` |
 | `GET /projects` | machine-registered projects (single-mount; not dual-mounted) | `Array<RegistryEntry>` *(the one bare-array exception — `/projects` is the switcher entry-point and its consumers (web, MCP) treat it as a list primitive)* |
 | `GET /projects/:project` | singular project lookup | `{ project: RegistryEntry }` |
+| `GET /api/config` | daemon auth-mode negotiation (ADR-073 §3a); always unauthenticated | `{ publicRead: boolean, authProxy: boolean }` |
 
 ## Write-side endpoints
 
@@ -54,6 +55,7 @@ Bare arrays from REST endpoints are a contract violation. Why: an object can gro
 |------|--------|----------------|
 | `POST /graph/scan` | re-runs static-extraction pass | `{ nodesAdded, edgesAdded, durationMs }` |
 | `POST /policies/check` | dry-run policy evaluation; body `{ hypotheticalAction? }` | `{ allowed, violations: PolicyViolation[] }` |
+| `POST /snapshot` | merges an incoming snapshot from `neat sync` (ADR-074 §1); body `{ snapshot: SnapshotV3 }` | `{ project, nodesAdded, edgesAdded, nodeCount, edgeCount }` |
 
 The OTLP receiver lives on its own port (`:4318`) — not part of the REST API.
 

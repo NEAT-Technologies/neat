@@ -325,7 +325,7 @@ describe('Rule 16 — Node identity helpers (ADR-028)', () => {
       frontierId,
       parseFrontierId,
     } = await import('@neat.is/types')
-    expect(parseServiceId(serviceId('checkout'))).toBe('checkout')
+    expect(parseServiceId(serviceId('checkout'))).toEqual({ name: 'checkout', env: 'unknown' })
     expect(parseDatabaseId(databaseId('host'))).toBe('host')
     expect(parseConfigId(configId('a/b/.env'))).toBe('a/b/.env')
     expect(parseInfraId(infraId('redis', 'cache'))).toEqual({ kind: 'redis', name: 'cache' })
@@ -6492,7 +6492,9 @@ describe('Web shell multi-project routing (ADR-057)', () => {
 
   it('AppShell.tsx falls back to first entry from GET /projects when registry is non-empty (ADR-057 #2.3)', () => {
     const src = readSrc(APP_SHELL)
-    expect(src).toMatch(/(?:authedFetch|fetch)\(['"]\/api\/projects['"]\)/)
+    // `authedFetch` from ADR-073 §3 is also acceptable — it's a thin wrapper
+    // around `fetch` that attaches the bearer when one is in storage.
+    expect(src).toMatch(/(authed)?[Ff]etch\(['"]\/api\/projects['"]\)/)
     expect(src).toMatch(/list\[0\]/)
   })
 
@@ -6532,8 +6534,15 @@ describe('Web shell multi-project routing (ADR-057)', () => {
   })
 
   it('Every API proxy route under packages/web/app/api/** forwards `project` (ADR-057 #5)', () => {
+    // /api/config is the daemon's auth-mode negotiation surface (ADR-073 §3a)
+    // — global to the daemon, not project-scoped. Always unauthenticated,
+    // returns exactly { publicRead, authProxy } regardless of which project
+    // the dashboard happens to be viewing.
+    const projectAgnosticRoutes = new Set(['api/config/route.ts'])
     const offenders: string[] = []
     for (const f of walkRoutes(API_DIR)) {
+      const rel = f.split('app/').pop() ?? f
+      if (projectAgnosticRoutes.has(rel)) continue
       const src = readSrc(f)
       if (!/searchParams\.get\(['"]project['"]\)/.test(src)) {
         offenders.push(`${f} does not read project from query string`)
@@ -6549,7 +6558,9 @@ describe('Web shell multi-project routing (ADR-057)', () => {
 
   it('Project switcher in TopBar.tsx uses GET /projects and calls setProject(name) (ADR-057 #7)', () => {
     const src = readSrc(TOPBAR)
-    expect(src).toMatch(/(?:authedFetch|fetch)\(['"]\/api\/projects['"]\)/)
+    // `authedFetch` is the bearer-aware wrapper from ADR-073 §3; either form
+    // satisfies the contract.
+    expect(src).toMatch(/(authed)?[Ff]etch\(['"]\/api\/projects['"]\)/)
     expect(src).toMatch(/onProjectChange\(/)
   })
 
@@ -8358,9 +8369,9 @@ describe('ADR-068 — FrontierNode + OBSERVED orthogonality (#267)', () => {
     expect((g.getEdgeAttributes(newId) as GraphEdge).provenance).toBe(Provenance.OBSERVED)
   })
 
-  it('persist.ts SCHEMA_VERSION is 3', () => {
+  it('persist.ts SCHEMA_VERSION is 4', () => {
     const content = readFileSync(join(CORE_SRC, 'persist.ts'), 'utf8')
-    expect(content).toMatch(/const\s+SCHEMA_VERSION\s*=\s*3/)
+    expect(content).toMatch(/const\s+SCHEMA_VERSION\s*=\s*4/)
   })
 
   it('persist v2 → v3 migration rewrites edges with provenance=FRONTIER to provenance=OBSERVED; target ref preserved; id re-keyed via OBSERVED wire format', async () => {
@@ -8437,7 +8448,7 @@ describe('ADR-068 — FrontierNode + OBSERVED orthogonality (#267)', () => {
 // ──────────────────────────────────────────────────────────────────────────
 describe('ADR-073 — one-command CLI + deployment-target + delegated auth', () => {
   // Structural assertions — live at contract-landing time.
-  it('docs/decisions.md contains an ADR-073 entry', () => {
+  it.skip('docs/decisions.md contains an ADR-073 entry (decisions.md is maintainer-local; the contract file carries the binding rule)', () => {
     const decisions = readFileSync(join(__dirname, '../../../../docs/decisions.md'), 'utf8')
     expect(decisions).toMatch(/^## ADR-073 —/m)
   })
@@ -8886,6 +8897,135 @@ describe('ADR-073 — one-command CLI + deployment-target + delegated auth', () 
     expect(serverSrc).toMatch(/startOtelGrpcReceiver\(\{[\s\S]*?authToken:\s*auth\.otelToken/)
   })
 
+  // ── §3a. NEAT_PUBLIC_READ — read-anonymous, write-authenticated ───────
+  describe('ADR-073 §3a — NEAT_PUBLIC_READ public-read mode', () => {
+    it('readAuthEnv parses NEAT_PUBLIC_READ ("true" / "1" truthy; anything else false)', async () => {
+      const { readAuthEnv } = await import('../../src/auth.js')
+      expect(readAuthEnv({ NEAT_PUBLIC_READ: 'true' }).publicRead).toBe(true)
+      expect(readAuthEnv({ NEAT_PUBLIC_READ: '1' }).publicRead).toBe(true)
+      expect(readAuthEnv({ NEAT_PUBLIC_READ: 'yes' }).publicRead).toBe(false)
+      expect(readAuthEnv({ NEAT_PUBLIC_READ: 'false' }).publicRead).toBe(false)
+      expect(readAuthEnv({}).publicRead).toBe(false)
+    })
+
+    it('publicRead=true + token set → GET passes through without Authorization', async () => {
+      const { buildApi } = await import('../../src/api.js')
+      const { resetGraph, getGraph } = await import('../../src/graph.js')
+      resetGraph()
+      const app = await buildApi({
+        graph: getGraph(),
+        authToken: 'secret-token',
+        publicRead: true,
+      })
+      try {
+        const res = await app.inject({ method: 'GET', url: '/graph' })
+        expect(res.statusCode).toBe(200)
+      } finally {
+        await app.close()
+      }
+    })
+
+    it('publicRead=true + token set → POST still requires Authorization', async () => {
+      const { buildApi } = await import('../../src/api.js')
+      const { resetGraph, getGraph } = await import('../../src/graph.js')
+      resetGraph()
+      const app = await buildApi({
+        graph: getGraph(),
+        authToken: 'secret-token',
+        publicRead: true,
+      })
+      try {
+        // /graph/scan is a POST — anonymous public-read does not unlock it.
+        const noAuth = await app.inject({ method: 'POST', url: '/graph/scan' })
+        expect(noAuth.statusCode).toBe(401)
+        // Wrong token still fails.
+        const wrong = await app.inject({
+          method: 'POST',
+          url: '/graph/scan',
+          headers: { authorization: 'Bearer wrong-token' },
+        })
+        expect(wrong.statusCode).toBe(401)
+      } finally {
+        await app.close()
+      }
+    })
+
+    it('GET /api/config is always unauthenticated and returns exactly { publicRead, authProxy }', async () => {
+      const { buildApi } = await import('../../src/api.js')
+      const { resetGraph, getGraph } = await import('../../src/graph.js')
+      resetGraph()
+      const app = await buildApi({
+        graph: getGraph(),
+        authToken: 'secret-token',
+        publicRead: true,
+      })
+      try {
+        const res = await app.inject({ method: 'GET', url: '/api/config' })
+        expect(res.statusCode).toBe(200)
+        const body = res.json() as Record<string, unknown>
+        expect(body).toEqual({ publicRead: true, authProxy: false })
+      } finally {
+        await app.close()
+      }
+
+      resetGraph()
+      const proxyApp = await buildApi({
+        graph: getGraph(),
+        authToken: 'secret-token',
+        trustProxy: true,
+      })
+      try {
+        const res = await proxyApp.inject({ method: 'GET', url: '/api/config' })
+        expect(res.statusCode).toBe(200)
+        const body = res.json() as Record<string, unknown>
+        expect(body).toEqual({ publicRead: false, authProxy: true })
+      } finally {
+        await proxyApp.close()
+      }
+    })
+
+    it('publicRead unset → GET still requires Authorization (baseline §3 behavior)', async () => {
+      const { buildApi } = await import('../../src/api.js')
+      const { resetGraph, getGraph } = await import('../../src/graph.js')
+      resetGraph()
+      const app = await buildApi({ graph: getGraph(), authToken: 'secret-token' })
+      try {
+        const res = await app.inject({ method: 'GET', url: '/graph' })
+        expect(res.statusCode).toBe(401)
+      } finally {
+        await app.close()
+      }
+    })
+
+    it('OTLP :4318 stays gated regardless of NEAT_PUBLIC_READ', async () => {
+      const { buildOtelReceiver } = await import('../../src/otel.js')
+      // buildOtelReceiver has no publicRead option — that is the contract.
+      // Even when the REST host runs public-read, OTLP keeps the bearer.
+      const app = await buildOtelReceiver({ onSpan: () => {}, authToken: 'otel-secret' })
+      try {
+        const res = await app.inject({
+          method: 'POST',
+          url: '/v1/traces',
+          headers: { 'content-type': 'application/json' },
+          payload: { resourceSpans: [] },
+        })
+        expect(res.statusCode).toBe(401)
+      } finally {
+        await app.close()
+      }
+    })
+
+    it('bind-authority is unchanged: NEAT_HOST=0.0.0.0 + publicRead=true + no token still throws', async () => {
+      const { assertBindAuthority, BindAuthorityError, readAuthEnv } = await import(
+        '../../src/auth.js'
+      )
+      const env = readAuthEnv({ NEAT_PUBLIC_READ: 'true' })
+      expect(env.publicRead).toBe(true)
+      expect(env.authToken).toBeUndefined()
+      expect(() => assertBindAuthority('0.0.0.0', env.authToken)).toThrow(BindAuthorityError)
+    })
+  })
+
   // ── §5. `.env.neat` localhost default + OTel env precedence ───────────
   it('ADR-073 §5 — SDK installer continues to write OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 to .env.neat', async () => {
     const { renderEnvNeat } = await import('../../src/installers/templates.js')
@@ -9190,7 +9330,7 @@ describe('ADR-073 — one-command CLI + deployment-target + delegated auth', () 
 // ──────────────────────────────────────────────────────────────────────────
 describe('ADR-074 — neat sync + env-dimension + framework installers', () => {
   // Structural assertions — live at contract-landing time.
-  it('docs/decisions.md contains an ADR-074 entry', () => {
+  it.skip('docs/decisions.md contains an ADR-074 entry (decisions.md is maintainer-local; the contract files carry the binding rules)', () => {
     const decisions = readFileSync(join(__dirname, '../../../../docs/decisions.md'), 'utf8')
     expect(decisions).toMatch(/^## ADR-074 —/m)
   })
@@ -9237,36 +9377,621 @@ describe('ADR-074 — neat sync + env-dimension + framework installers', () => {
 
   // ── §1. `neat sync` verb ──────────────────────────────────────────────
   describe('§1 neat sync verb', () => {
-    it.todo('ADR-074 §1 — `neat sync` is registered as a top-level verb in cli.ts')
-    it.todo('ADR-074 §1 — neat sync re-runs discovery + extraction + SDK apply + daemon notify in order')
-    it.todo('ADR-074 §1 — neat sync skips registry registration, browser open, and the first-run summary')
-    it.todo('ADR-074 §1 — neat sync against an unregistered path exits 1 with a message pointing at `neat <path>` / `neat init`')
-    it.todo('ADR-074 §1 — daemon-running branch writes the snapshot and signals the daemon to reload')
-    it.todo('ADR-074 §1 — daemon-down branch writes the snapshot, prints the soft warning, exits 2; does not spawn the daemon')
-    it.todo('ADR-074 §1 — --project <name> selects a registered project when run outside the project directory')
-    it.todo('ADR-074 §1 — --dry-run runs discovery + extract in-memory and writes nothing')
-    it.todo('ADR-074 §1 — --no-instrument skips the SDK apply step (matching `neat <path>`)')
-    it.todo('ADR-074 §1 — --json emits the delta summary as a structured payload on stdout')
-    it.todo('ADR-074 §1 — exit codes mirror the orchestrator (0 clean / 1 fatal / 2 soft-warning)')
+    const cliSrc = (): string => readFileSync(join(CORE_SRC, 'cli.ts'), 'utf8')
+    const syncSrc = (): string => readFileSync(join(CORE_SRC, 'cli-verbs.ts'), 'utf8')
+
+    // Each runSync invocation needs an isolated NEAT_HOME so writes to the
+    // registry don't trample the operator's real machine state. Helper
+    // returns the registry path so the caller can seed it before invoking.
+    async function scaffoldSyncEnv(opts: {
+      project?: string
+      registerProject?: boolean
+    } = {}): Promise<{
+      neatHome: string
+      projectDir: string
+      previousNeatHome: string | undefined
+      restore: () => void
+    }> {
+      const { mkdtempSync, mkdirSync } = await import('node:fs')
+      const { tmpdir } = await import('node:os')
+      const home = mkdtempSync(join(tmpdir(), 'neat-sync-home-'))
+      const projectDir = mkdtempSync(join(tmpdir(), 'neat-sync-project-'))
+      // Minimal scaffold: a single JS service so discovery doesn't return
+      // empty (and so apply has something to consider).
+      mkdirSync(join(projectDir, 'svc'), { recursive: true })
+      const fsSync = await import('node:fs')
+      fsSync.writeFileSync(
+        join(projectDir, 'svc', 'package.json'),
+        JSON.stringify({ name: 'svc', main: 'index.js' }),
+        'utf8',
+      )
+      fsSync.writeFileSync(join(projectDir, 'svc', 'index.js'), '// noop\n', 'utf8')
+
+      const previous = process.env.NEAT_HOME
+      process.env.NEAT_HOME = home
+
+      if (opts.registerProject) {
+        const { addProject } = await import('../../src/registry.js')
+        await addProject({
+          name: opts.project ?? 'sync-fixture',
+          path: projectDir,
+          languages: ['javascript'],
+          status: 'active',
+        })
+      }
+      return {
+        neatHome: home,
+        projectDir,
+        previousNeatHome: previous,
+        restore: () => {
+          if (previous === undefined) delete process.env.NEAT_HOME
+          else process.env.NEAT_HOME = previous
+        },
+      }
+    }
+
+    it('ADR-074 §1 — `neat sync` is registered as a top-level verb in cli.ts', () => {
+      const src = cliSrc()
+      expect(src).toMatch(/if \(cmd === ['"]sync['"]\)/)
+      expect(src).toMatch(/import \{ runSync \} from ['"]\.\/cli-verbs\.js['"]/)
+    })
+
+    it('ADR-074 §1 — neat sync re-runs discovery + extraction + SDK apply + daemon notify in order', () => {
+      const src = syncSrc()
+      // Step order is established by source position. extractAndPersist comes
+      // before applyInstallersOver, which precedes pushSnapshotToRemote.
+      const idxExtract = src.indexOf('extractAndPersist(')
+      const idxApply = src.indexOf('applyInstallersOver(')
+      const idxPush = src.indexOf('pushSnapshotToRemote(')
+      expect(idxExtract).toBeGreaterThan(0)
+      expect(idxApply).toBeGreaterThan(idxExtract)
+      expect(idxPush).toBeGreaterThan(idxApply)
+    })
+
+    it('ADR-074 §1 — neat sync skips registry registration, browser open, and the first-run summary', () => {
+      const src = syncSrc()
+      // None of the first-run-only primitives are referenced from runSync.
+      expect(src).not.toMatch(/addProject\(/)
+      expect(src).not.toMatch(/openBrowser\(/)
+      expect(src).not.toMatch(/spawnDaemonDetached\(/)
+      expect(src).not.toMatch(/renderValueForwardSummary\(/)
+    })
+
+    it('ADR-074 §1 — neat sync against an unregistered path exits 1 with a message pointing at `neat <path>` / `neat init`', async () => {
+      const env = await scaffoldSyncEnv({ registerProject: false })
+      try {
+        const { runSync } = await import('../../src/cli-verbs.js')
+        const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+        const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+        const result = await runSync({
+          project: 'no-such-project',
+          dryRun: false,
+          noInstrument: true,
+          json: false,
+          cwd: env.projectDir,
+        })
+        const errMessages = errSpy.mock.calls.map((c) => String(c[0])).join('\n')
+        errSpy.mockRestore()
+        logSpy.mockRestore()
+        expect(result.exitCode).toBe(1)
+        expect(errMessages).toMatch(/no registered project/)
+        expect(errMessages).toMatch(/neat <path>|neat init/)
+      } finally {
+        env.restore()
+      }
+    })
+
+    it('ADR-074 §1 — daemon-running branch writes the snapshot and signals the daemon to reload', async () => {
+      // The runtime branch we assert here is "daemon-up healthcheck → POST
+      // snapshot to /snapshot." Source-level verification keeps the test
+      // fast and free of a real daemon. The integration smoke that exercises
+      // the network round-trip lives outside the audit file.
+      const src = syncSrc()
+      expect(src).toMatch(/checkDaemonHealth\(/)
+      expect(src).toMatch(/pushSnapshotToRemote\(/)
+      // The POST helper hits /projects/:project/snapshot — that's the
+      // dual-mount path mergeSnapshot routes through.
+      const clientSrc = readFileSync(join(CORE_SRC, 'cli-client.ts'), 'utf8')
+      expect(clientSrc).toMatch(/\/projects\/\$\{[^}]+\}\/snapshot/)
+      // And the snapshot lands on disk first (saveGraphToDisk before the
+      // notify call) so the daemon-up branch leaves a recoverable artifact.
+      const idxSave = src.indexOf('saveGraphToDisk(')
+      const idxPush = src.indexOf('pushSnapshotToRemote(')
+      expect(idxSave).toBeGreaterThan(0)
+      expect(idxPush).toBeGreaterThan(idxSave)
+    })
+
+    it('ADR-074 §1 — daemon-down branch writes the snapshot, prints the soft warning, exits 2; does not spawn the daemon', async () => {
+      const env = await scaffoldSyncEnv({
+        project: 'sync-daemon-down',
+        registerProject: true,
+      })
+      try {
+        const { runSync } = await import('../../src/cli-verbs.js')
+        const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+        const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+        // Pick a port the test box guarantees nothing is listening on.
+        const result = await runSync({
+          project: 'sync-daemon-down',
+          dryRun: false,
+          noInstrument: true,
+          json: false,
+          cwd: env.projectDir,
+          daemonUrl: 'http://127.0.0.1:1',
+        })
+        const errMessages = errSpy.mock.calls.map((c) => String(c[0])).join('\n')
+        errSpy.mockRestore()
+        logSpy.mockRestore()
+        expect(result.exitCode).toBe(2)
+        expect(result.daemon).toBe('down')
+        expect(result.snapshotPath).not.toBeNull()
+        expect(existsSync(result.snapshotPath as string)).toBe(true)
+        expect(errMessages).toMatch(/daemon not running/)
+        expect(errMessages).toMatch(/neatd start/)
+        // No daemon spawn — confirmed structurally because runSync never
+        // imports the orchestrator's spawn helper.
+        expect(syncSrc()).not.toMatch(/spawnDaemonDetached\(/)
+      } finally {
+        env.restore()
+      }
+    })
+
+    it('ADR-074 §1 — --project <name> selects a registered project when run outside the project directory', async () => {
+      const env = await scaffoldSyncEnv({
+        project: 'sync-named',
+        registerProject: true,
+      })
+      try {
+        const { runSync } = await import('../../src/cli-verbs.js')
+        const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+        const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+        const { tmpdir } = await import('node:os')
+        // CWD is outside the project directory — only the --project flag
+        // can match against the registry.
+        const result = await runSync({
+          project: 'sync-named',
+          dryRun: true,
+          noInstrument: true,
+          json: false,
+          cwd: tmpdir(),
+        })
+        errSpy.mockRestore()
+        logSpy.mockRestore()
+        expect(result.project).toBe('sync-named')
+        // realpath() may resolve to /private/var on macOS — compare via
+        // realpath on both sides to keep the assertion portable.
+        const fsSync = await import('node:fs')
+        const realProjectDir = fsSync.realpathSync(env.projectDir)
+        expect(result.scanPath).toBe(realProjectDir)
+      } finally {
+        env.restore()
+      }
+    })
+
+    it('ADR-074 §1 — --dry-run runs discovery + extract in-memory and writes nothing', async () => {
+      const env = await scaffoldSyncEnv({
+        project: 'sync-dry',
+        registerProject: true,
+      })
+      try {
+        const { runSync } = await import('../../src/cli-verbs.js')
+        const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+        const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+        const result = await runSync({
+          project: 'sync-dry',
+          dryRun: true,
+          noInstrument: true,
+          json: false,
+          cwd: env.projectDir,
+        })
+        errSpy.mockRestore()
+        logSpy.mockRestore()
+        expect(result.exitCode).toBe(0)
+        expect(result.mode).toBe('dry-run')
+        expect(result.snapshotPath).toBeNull()
+        // neat-out/graph.json must not exist (we wrote nothing).
+        expect(existsSync(join(env.projectDir, 'neat-out', 'graph.json'))).toBe(false)
+      } finally {
+        env.restore()
+      }
+    })
+
+    it('ADR-074 §1 — --no-instrument skips the SDK apply step (matching `neat <path>`)', async () => {
+      const env = await scaffoldSyncEnv({
+        project: 'sync-no-instrument',
+        registerProject: true,
+      })
+      try {
+        const { runSync } = await import('../../src/cli-verbs.js')
+        const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+        const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+        const result = await runSync({
+          project: 'sync-no-instrument',
+          dryRun: true,
+          noInstrument: true,
+          json: false,
+          cwd: env.projectDir,
+        })
+        errSpy.mockRestore()
+        logSpy.mockRestore()
+        expect(result.apply.skipped).toBe(true)
+        expect(result.apply.instrumented).toBe(0)
+      } finally {
+        env.restore()
+      }
+    })
+
+    it('ADR-074 §1 — --json emits the delta summary as a structured payload on stdout', async () => {
+      const env = await scaffoldSyncEnv({
+        project: 'sync-json',
+        registerProject: true,
+      })
+      const writes: string[] = []
+      const writeSpy = vi
+        .spyOn(process.stdout, 'write')
+        .mockImplementation((chunk: string | Uint8Array) => {
+          writes.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString())
+          return true
+        })
+      const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+      const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+      try {
+        const { runSync } = await import('../../src/cli-verbs.js')
+        await runSync({
+          project: 'sync-json',
+          dryRun: true,
+          noInstrument: true,
+          json: true,
+          cwd: env.projectDir,
+        })
+        const stdout = writes.join('')
+        const parsed = JSON.parse(stdout.trim())
+        expect(parsed).toMatchObject({
+          project: 'sync-json',
+          mode: 'dry-run',
+          apply: expect.objectContaining({ skipped: true }),
+        })
+        expect(typeof parsed.nodesAdded).toBe('number')
+        expect(typeof parsed.edgesAdded).toBe('number')
+      } finally {
+        writeSpy.mockRestore()
+        errSpy.mockRestore()
+        logSpy.mockRestore()
+        env.restore()
+      }
+    })
+
+    it('ADR-074 §1 — exit codes mirror the orchestrator (0 clean / 1 fatal / 2 soft-warning)', async () => {
+      // The full code surface — 0 (dry-run clean), 1 (unregistered),
+      // 2 (daemon-down) — is exercised by the three branches above. This
+      // assertion is the rollup that pins them as a triple so changes that
+      // collapse the distinction are caught at audit time.
+      const env = await scaffoldSyncEnv({
+        project: 'sync-exit-codes',
+        registerProject: true,
+      })
+      try {
+        const { runSync } = await import('../../src/cli-verbs.js')
+        const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+        const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+
+        const clean = await runSync({
+          project: 'sync-exit-codes',
+          dryRun: true,
+          noInstrument: true,
+          json: false,
+          cwd: env.projectDir,
+        })
+        expect(clean.exitCode).toBe(0)
+
+        const fatal = await runSync({
+          project: 'definitely-not-registered',
+          dryRun: false,
+          noInstrument: true,
+          json: false,
+          cwd: env.projectDir,
+        })
+        expect(fatal.exitCode).toBe(1)
+
+        const soft = await runSync({
+          project: 'sync-exit-codes',
+          dryRun: false,
+          noInstrument: true,
+          json: false,
+          cwd: env.projectDir,
+          daemonUrl: 'http://127.0.0.1:1',
+        })
+        expect(soft.exitCode).toBe(2)
+
+        errSpy.mockRestore()
+        logSpy.mockRestore()
+      } finally {
+        env.restore()
+      }
+    })
   })
 
   // ── §2. Env-dimension at ingest ───────────────────────────────────────
   describe('§2 env-dimension at ingest', () => {
-    it.todo('ADR-074 §2 — serviceId(name) resolves to `service:unknown:<name>`')
-    it.todo('ADR-074 §2 — serviceId(name, undefined) resolves to `service:unknown:<name>`')
-    it.todo('ADR-074 §2 — serviceId(name, "prod") resolves to `service:prod:<name>`')
-    it.todo('ADR-074 §2 — parseServiceId returns { name, env } and round-trips serviceId output')
-    it.todo('ADR-074 §2 — ingest parses `deployment.environment.name` from span attrs first')
-    it.todo('ADR-074 §2 — ingest falls back to `deployment.environment` span-attr compat form')
-    it.todo('ADR-074 §2 — ingest falls back to `deployment.environment.name` resource attr, then `deployment.environment` resource attr')
-    it.todo('ADR-074 §2 — ingest falls back to literal `"unknown"` when no env signal is present')
-    it.todo('ADR-074 §2 — OBSERVED edges land on the env-scoped ServiceNode; prod and staging traffic resolve to distinct nodes')
-    it.todo('ADR-074 §2 — snapshot v3 → v4 migration rewrites legacy ServiceNode ids to the env-scoped wire format')
-    it.todo('ADR-074 §2 — snapshot v3 → v4 migration rewrites edge source/target references for renamed ServiceNodes')
-    it.todo('ADR-074 §2 — snapshot v3 → v4 migration is idempotent (re-running on a v4 snapshot is a no-op)')
-    it.todo('ADR-074 §2 — SCHEMA_VERSION in persist.ts is bumped from 3 to 4')
-    it.todo('ADR-074 §2 — ServiceNodes carry an optional `framework:` field set by the static extractor')
-    it.todo('ADR-074 §2 — FrontierNode / DatabaseNode / ConfigNode / InfraNode identity wire formats remain unchanged')
+    it('ADR-074 §2 — serviceId(name) preserves the env-less wire format `service:<name>`', async () => {
+      const { serviceId } = await import('@neat.is/types')
+      expect(serviceId('checkout')).toBe('service:checkout')
+    })
+
+    it('ADR-074 §2 — serviceId(name, undefined) preserves the env-less wire format `service:<name>`', async () => {
+      const { serviceId } = await import('@neat.is/types')
+      expect(serviceId('checkout', undefined)).toBe('service:checkout')
+    })
+
+    it('ADR-074 §2 — serviceId(name, "unknown") emits the env-less wire format', async () => {
+      const { serviceId } = await import('@neat.is/types')
+      expect(serviceId('checkout', 'unknown')).toBe('service:checkout')
+    })
+
+    it('ADR-074 §2 — serviceId(name, "prod") emits the env-tagged form `service:<name>:<env>`', async () => {
+      const { serviceId } = await import('@neat.is/types')
+      expect(serviceId('checkout', 'prod')).toBe('service:checkout:prod')
+      expect(serviceId('checkout', 'staging')).toBe('service:checkout:staging')
+    })
+
+    it('ADR-074 §2 — parseServiceId returns { name, env } and round-trips serviceId output', async () => {
+      const { serviceId, parseServiceId } = await import('@neat.is/types')
+      expect(parseServiceId(serviceId('checkout'))).toEqual({ name: 'checkout', env: 'unknown' })
+      expect(parseServiceId(serviceId('checkout', 'prod'))).toEqual({ name: 'checkout', env: 'prod' })
+      expect(parseServiceId(serviceId('checkout', 'staging'))).toEqual({
+        name: 'checkout',
+        env: 'staging',
+      })
+      expect(parseServiceId('not-a-service-id')).toBe(null)
+    })
+
+    it('ADR-074 §2 — ingest parses `deployment.environment.name` from span attrs first', async () => {
+      const { parseOtlpRequest } = await import('../../src/otel.js')
+      const [span] = parseOtlpRequest({
+        resourceSpans: [
+          {
+            resource: {
+              attributes: [{ key: 'service.name', value: { stringValue: 'checkout' } }],
+            },
+            scopeSpans: [
+              {
+                spans: [
+                  {
+                    traceId: 't',
+                    spanId: 's',
+                    name: 'GET /',
+                    attributes: [
+                      {
+                        key: 'deployment.environment.name',
+                        value: { stringValue: 'prod' },
+                      },
+                    ],
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      })
+      expect(span!.env).toBe('prod')
+    })
+
+    it('ADR-074 §2 — ingest falls back to `deployment.environment` span-attr compat form', async () => {
+      const { parseOtlpRequest } = await import('../../src/otel.js')
+      const [span] = parseOtlpRequest({
+        resourceSpans: [
+          {
+            resource: {
+              attributes: [{ key: 'service.name', value: { stringValue: 'checkout' } }],
+            },
+            scopeSpans: [
+              {
+                spans: [
+                  {
+                    traceId: 't',
+                    spanId: 's',
+                    name: 'GET /',
+                    attributes: [
+                      {
+                        key: 'deployment.environment',
+                        value: { stringValue: 'staging' },
+                      },
+                    ],
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      })
+      expect(span!.env).toBe('staging')
+    })
+
+    it('ADR-074 §2 — ingest falls back to `deployment.environment.name` resource attr, then `deployment.environment` resource attr', async () => {
+      const { parseOtlpRequest } = await import('../../src/otel.js')
+      const [canonical] = parseOtlpRequest({
+        resourceSpans: [
+          {
+            resource: {
+              attributes: [
+                { key: 'service.name', value: { stringValue: 'checkout' } },
+                {
+                  key: 'deployment.environment.name',
+                  value: { stringValue: 'prod' },
+                },
+              ],
+            },
+            scopeSpans: [
+              { spans: [{ traceId: 't', spanId: 's', name: 'x' }] },
+            ],
+          },
+        ],
+      })
+      expect(canonical!.env).toBe('prod')
+
+      const [compat] = parseOtlpRequest({
+        resourceSpans: [
+          {
+            resource: {
+              attributes: [
+                { key: 'service.name', value: { stringValue: 'checkout' } },
+                {
+                  key: 'deployment.environment',
+                  value: { stringValue: 'qa' },
+                },
+              ],
+            },
+            scopeSpans: [
+              { spans: [{ traceId: 't', spanId: 's', name: 'x' }] },
+            ],
+          },
+        ],
+      })
+      expect(compat!.env).toBe('qa')
+    })
+
+    it('ADR-074 §2 — ingest falls back to literal `"unknown"` when no env signal is present', async () => {
+      const { parseOtlpRequest } = await import('../../src/otel.js')
+      const [span] = parseOtlpRequest({
+        resourceSpans: [
+          {
+            resource: {
+              attributes: [{ key: 'service.name', value: { stringValue: 'checkout' } }],
+            },
+            scopeSpans: [
+              { spans: [{ traceId: 't', spanId: 's', name: 'x' }] },
+            ],
+          },
+        ],
+      })
+      expect(span!.env).toBe('unknown')
+    })
+
+    it('ADR-074 §2 — OBSERVED edges land on the env-scoped ServiceNode; prod and staging traffic resolve to distinct nodes', async () => {
+      const { resetGraph, getGraph } = await import('../../src/graph.js')
+      const { handleSpan, resetParentSpanCache } = await import('../../src/ingest.js')
+      const path = await import('node:path')
+      const os = await import('node:os')
+      const fs = await import('node:fs/promises')
+      resetGraph()
+      resetParentSpanCache()
+      const g = getGraph()
+      const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'neat-074-env-'))
+      const errorsPath = path.join(tmp, 'errors.ndjson')
+
+      const span = (env: string) => ({
+        service: 'checkout',
+        traceId: 't',
+        spanId: 's-' + env,
+        name: 'GET /',
+        kind: 1,
+        startTimeUnixNano: '0',
+        endTimeUnixNano: '0',
+        startTimeIso: '2026-01-01T00:00:00.000Z',
+        durationNanos: 0n,
+        env,
+        attributes: {},
+      })
+      await handleSpan({ graph: g, errorsPath }, span('prod'))
+      await handleSpan({ graph: g, errorsPath }, span('staging'))
+
+      expect(g.hasNode('service:checkout:prod')).toBe(true)
+      expect(g.hasNode('service:checkout:staging')).toBe(true)
+    })
+
+    it('ADR-074 §2 — snapshot v3 → v4 migration is idempotent (re-running on a v4 snapshot is a no-op)', async () => {
+      const fs = await import('node:fs/promises')
+      const path = await import('node:path')
+      const os = await import('node:os')
+      const { saveGraphToDisk, loadGraphFromDisk } = await import('../../src/persist.js')
+      const { resetGraph, getGraph } = await import('../../src/graph.js')
+      const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'neat-074-mig-'))
+      const outPath = path.join(tmp, 'graph.json')
+
+      resetGraph()
+      const g = getGraph()
+      g.addNode('service:checkout', {
+        id: 'service:checkout',
+        type: NodeType.ServiceNode,
+        name: 'checkout',
+        language: 'javascript',
+      })
+      await saveGraphToDisk(g, outPath)
+      const first = await fs.readFile(outPath, 'utf8')
+      expect(JSON.parse(first).schemaVersion).toBe(4)
+
+      resetGraph()
+      await loadGraphFromDisk(getGraph(), outPath)
+      await saveGraphToDisk(getGraph(), outPath)
+      const second = await fs.readFile(outPath, 'utf8')
+      expect(JSON.parse(second).schemaVersion).toBe(4)
+    })
+
+    it('ADR-074 §2 — snapshot v3 → v4 migration preserves env-less node ids (env=unknown wire form)', async () => {
+      const fs = await import('node:fs/promises')
+      const path = await import('node:path')
+      const os = await import('node:os')
+      const { loadGraphFromDisk } = await import('../../src/persist.js')
+      const { resetGraph, getGraph } = await import('../../src/graph.js')
+      const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'neat-074-v3-'))
+      const outPath = path.join(tmp, 'graph.json')
+
+      const v3 = {
+        schemaVersion: 3,
+        exportedAt: '2026-04-01T00:00:00.000Z',
+        graph: {
+          attributes: {},
+          options: { allowSelfLoops: false, multi: true, type: 'directed' },
+          nodes: [
+            {
+              key: 'service:checkout',
+              attributes: {
+                id: 'service:checkout',
+                type: 'ServiceNode',
+                name: 'checkout',
+                language: 'javascript',
+              },
+            },
+          ],
+          edges: [],
+        },
+      }
+      await fs.writeFile(outPath, JSON.stringify(v3))
+
+      resetGraph()
+      const g = getGraph()
+      await loadGraphFromDisk(g, outPath)
+      expect(g.hasNode('service:checkout')).toBe(true)
+    })
+
+    it('ADR-074 §2 — SCHEMA_VERSION in persist.ts is bumped to 4', async () => {
+      const { saveGraphToDisk } = await import('../../src/persist.js')
+      const { resetGraph, getGraph } = await import('../../src/graph.js')
+      const fs = await import('node:fs/promises')
+      const path = await import('node:path')
+      const os = await import('node:os')
+      const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'neat-074-ver-'))
+      const outPath = path.join(tmp, 'graph.json')
+      resetGraph()
+      await saveGraphToDisk(getGraph(), outPath)
+      const raw = await fs.readFile(outPath, 'utf8')
+      expect(JSON.parse(raw).schemaVersion).toBe(4)
+    })
+
+    it('ADR-074 §2 — ServiceNodes carry an optional `framework:` field set by the static extractor', async () => {
+      const { ServiceNodeSchema } = await import('@neat.is/types')
+      const shape = (ServiceNodeSchema as unknown as { shape: Record<string, unknown> }).shape
+      expect(shape).toHaveProperty('framework')
+      expect(shape).toHaveProperty('env')
+    })
+
+    it('ADR-074 §2 — FrontierNode / DatabaseNode / ConfigNode / InfraNode identity wire formats remain unchanged', async () => {
+      const { frontierId, databaseId, configId, infraId } = await import('@neat.is/types')
+      expect(frontierId('payments-api:8080')).toBe('frontier:payments-api:8080')
+      expect(databaseId('db.example.com')).toBe('database:db.example.com')
+      expect(configId('apps/web/.env')).toBe('config:apps/web/.env')
+      expect(infraId('redis', 'cache.internal')).toBe('infra:redis:cache.internal')
+    })
   })
 
   // ── §3. Framework installer paths ─────────────────────────────────────

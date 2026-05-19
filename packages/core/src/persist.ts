@@ -3,9 +3,9 @@ import path from 'node:path'
 import { Provenance, observedEdgeId } from '@neat.is/types'
 import type { NeatGraph } from './graph.js'
 
-const SCHEMA_VERSION = 3
+export const SCHEMA_VERSION = 4
 
-interface PersistedGraph {
+export interface PersistedGraph {
   schemaVersion: number
   exportedAt: string
   graph: ReturnType<NeatGraph['export']>
@@ -38,6 +38,18 @@ function migrateV1ToV2(payload: PersistedGraph): PersistedGraph {
 // The 'FRONTIER' string literal here is the only place in the codebase that
 // recognises the legacy value; the Rule 1 contract scan exempts persist.ts
 // for exactly this reason.
+// v3 → v4: ServiceNode identity gains an optional env discriminator
+// (ADR-074 §2). The v4 wire format reads as a superset of v3 — the
+// env-less `service:<name>` form is preserved as the env=`'unknown'`
+// node and the v3 → v4 migration is a version-only bump.
+//
+// Edges and node ids that pre-date the env discriminator remain valid v4
+// ids; no rewrite is needed. Idempotent — re-running on a v4 snapshot
+// produces an identical payload.
+function migrateV3ToV4(payload: PersistedGraph): PersistedGraph {
+  return { ...payload, schemaVersion: 4 }
+}
+
 function migrateV2ToV3(payload: PersistedGraph): PersistedGraph {
   const edges = (payload.graph as {
     edges?: Array<{
@@ -98,6 +110,9 @@ export async function loadGraphFromDisk(graph: NeatGraph, outPath: string): Prom
   if (payload.schemaVersion === 2) {
     payload = migrateV2ToV3(payload)
   }
+  if (payload.schemaVersion === 3) {
+    payload = migrateV3ToV4(payload)
+  }
   if (payload.schemaVersion !== SCHEMA_VERSION) {
     throw new Error(
       `persist: unsupported snapshot schemaVersion ${payload.schemaVersion} (expected ${SCHEMA_VERSION})`,
@@ -152,3 +167,9 @@ export function startPersistLoop(
     process.off('SIGINT', onSignal)
   }
 }
+
+// Snapshot merge (ADR-074 §1) lives in ingest.ts — that's the mutation-
+// authority boundary per the lifecycle contract (Rule 3 / ADR-030). The
+// merge is a form of ingestion: an external snapshot lands on the live graph
+// the same way an OTel span does, preserving the EXTRACTED + OBSERVED
+// coexistence contract along the way.
