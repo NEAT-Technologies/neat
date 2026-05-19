@@ -153,6 +153,15 @@ export function renderPatch(sections: PatchSection[]): string {
       }
       lines.push('')
     }
+
+    // ADR-073 §1 — surface the next.config edit in the dry-run patch so the
+    // operator can review the framework-flag change before it lands.
+    if (plan.nextConfigEdit) {
+      lines.push('### next.config (framework flag)')
+      lines.push(`--- ${plan.nextConfigEdit.file}`)
+      lines.push(`+ experimental: { instrumentationHook: true }, // ${plan.nextConfigEdit.reason}`)
+      lines.push('')
+    }
   }
   return lines.join('\n')
 }

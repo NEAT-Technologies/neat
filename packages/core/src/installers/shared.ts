@@ -69,6 +69,21 @@ export interface InstallPlan {
   // installer is going to inject the require/import. Absent for libOnly
   // packages and for the Python installer.
   entryFile?: string
+  // ADR-073 §1 — when a framework owns its own boot, the installer skips
+  // `pkg.main` injection and emits framework-native instrumentation files
+  // instead. Currently only `'next'` is recognized; future frameworks add
+  // sibling values here.
+  framework?: 'next'
+  // ADR-073 §1 — Next.js' `next.config.{js,ts,mjs}` may need the
+  // `experimental.instrumentationHook: true` flag set when the major
+  // version is < 15. The apply phase mutates the file in place when this
+  // field is set. Absent → no config mutation planned.
+  nextConfigEdit?: {
+    file: string
+    // Reason this edit is queued — surfaces in the dry-run patch and the
+    // apply summary so the operator knows why their next.config moved.
+    reason: string
+  }
 }
 
 // ADR-069 §9 — apply outcome per service. The CLI surfaces these counts
@@ -107,6 +122,7 @@ export function isEmptyPlan(plan: InstallPlan): boolean {
     plan.dependencyEdits.length === 0 &&
     plan.entrypointEdits.length === 0 &&
     plan.envEdits.length === 0 &&
-    (plan.generatedFiles?.length ?? 0) === 0
+    (plan.generatedFiles?.length ?? 0) === 0 &&
+    plan.nextConfigEdit === undefined
   )
 }

@@ -34,6 +34,11 @@ import type {
   InstallPlan,
 } from './shared.js'
 import {
+  NEXT_INSTRUMENTATION_HEADER,
+  NEXT_INSTRUMENTATION_JS,
+  NEXT_INSTRUMENTATION_NODE_JS,
+  NEXT_INSTRUMENTATION_NODE_TS,
+  NEXT_INSTRUMENTATION_TS,
   OTEL_INIT_CJS,
   OTEL_INIT_ESM,
   OTEL_INIT_HEADER,
@@ -92,6 +97,44 @@ async function exists(p: string): Promise<boolean> {
 async function detect(serviceDir: string): Promise<boolean> {
   const pkg = await readPackageJson(serviceDir)
   return pkg !== null && typeof pkg.name === 'string'
+}
+
+// ADR-073 §1 — Next.js detection. A package is Next-flavored when it
+// declares `next` as a (dev)dependency AND ships a `next.config.{js,ts,mjs}`
+// at the package root. Both are required: a stray `next` import without the
+// config file isn't a Next app, and a config file without the dep is dead
+// configuration.
+const NEXT_CONFIG_CANDIDATES = ['next.config.js', 'next.config.ts', 'next.config.mjs']
+
+async function findNextConfig(serviceDir: string): Promise<string | null> {
+  for (const name of NEXT_CONFIG_CANDIDATES) {
+    const candidate = path.join(serviceDir, name)
+    if (await exists(candidate)) return candidate
+  }
+  return null
+}
+
+function hasNextDependency(pkg: PackageJsonShape): boolean {
+  return (
+    (pkg.dependencies?.next !== undefined) ||
+    (pkg.devDependencies?.next !== undefined)
+  )
+}
+
+// Parse the leading major version out of a semver range like "^14.0.3" or
+// "~15.0" or "15.0.0". Returns null when the range can't be read (workspace
+// links, git refs, "*", etc.).
+export function parseNextMajor(range: string | undefined): number | null {
+  if (!range) return null
+  const cleaned = range.trim().replace(/^[\^~>=<\s]+/, '')
+  const match = cleaned.match(/^(\d+)/)
+  if (!match) return null
+  const n = Number(match[1])
+  return Number.isFinite(n) ? n : null
+}
+
+async function isTypeScriptProject(serviceDir: string): Promise<boolean> {
+  return exists(path.join(serviceDir, 'tsconfig.json'))
 }
 
 // ADR-069 §2 + ADR-070 — entry resolution: pkg.main → pkg.bin → scripts.start
@@ -268,6 +311,113 @@ function lineIsOtelInjection(line: string): boolean {
   return /(?:require\(|import\s+)['"]\.\/otel-init[^'"]*['"]/.test(trimmed)
 }
 
+// ADR-073 §1 — Next.js apply path. Emits `instrumentation.{ts,js}` and
+// `instrumentation.node.{ts,js}` at the package root, plus `.env.neat`.
+// Skips entry-point injection entirely — Next loads the instrumentation
+// file through its own runtime hook. Queues a next.config edit only when
+// the declared major is < 15 (the flag is on-by-default from Next 15 on).
+async function planNext(
+  serviceDir: string,
+  pkg: PackageJsonShape,
+  manifestPath: string,
+  nextConfigPath: string,
+): Promise<InstallPlan> {
+  const useTs = await isTypeScriptProject(serviceDir)
+  const instrumentationFile = path.join(serviceDir, useTs ? 'instrumentation.ts' : 'instrumentation.js')
+  const instrumentationNodeFile = path.join(
+    serviceDir,
+    useTs ? 'instrumentation.node.ts' : 'instrumentation.node.js',
+  )
+  const envNeatFile = path.join(serviceDir, '.env.neat')
+
+  // Dependency edits — same four-deps invariant as the plain Node path.
+  const existingDeps = { ...(pkg.dependencies ?? {}), ...(pkg.devDependencies ?? {}) }
+  const dependencyEdits: DependencyEdit[] = []
+  for (const sdk of SDK_PACKAGES) {
+    if (sdk.name in existingDeps) continue
+    dependencyEdits.push({
+      file: manifestPath,
+      kind: 'add',
+      name: sdk.name,
+      version: sdk.version,
+    })
+  }
+
+  // Generated files — instrumentation pair + .env.neat. Existing files are
+  // preserved (skipIfExists honours user customisations and keeps the apply
+  // phase idempotent per ADR-069 §6).
+  const generatedFiles: GeneratedFile[] = []
+  if (!(await exists(instrumentationFile))) {
+    generatedFiles.push({
+      file: instrumentationFile,
+      contents: useTs ? NEXT_INSTRUMENTATION_TS : NEXT_INSTRUMENTATION_JS,
+      skipIfExists: true,
+    })
+  }
+  if (!(await exists(instrumentationNodeFile))) {
+    generatedFiles.push({
+      file: instrumentationNodeFile,
+      contents: useTs ? NEXT_INSTRUMENTATION_NODE_TS : NEXT_INSTRUMENTATION_NODE_JS,
+      skipIfExists: true,
+    })
+  }
+  if (!(await exists(envNeatFile))) {
+    generatedFiles.push({
+      file: envNeatFile,
+      contents: renderEnvNeat(pkg.name ?? path.basename(serviceDir)),
+      skipIfExists: true,
+    })
+  }
+
+  // ADR-073 §1 — `experimental.instrumentationHook: true` is required for
+  // Next 13 / 14 and a no-op on Next 15+. Plan the edit only when the
+  // declared major is < 15 and the flag isn't already present.
+  let nextConfigEdit: InstallPlan['nextConfigEdit']
+  const nextRange = pkg.dependencies?.next ?? pkg.devDependencies?.next
+  const nextMajor = parseNextMajor(nextRange)
+  if (nextMajor !== null && nextMajor < 15) {
+    try {
+      const raw = await fs.readFile(nextConfigPath, 'utf8')
+      if (!raw.includes('instrumentationHook')) {
+        nextConfigEdit = {
+          file: nextConfigPath,
+          reason: `enable experimental.instrumentationHook (Next ${nextMajor} requires the opt-in flag)`,
+        }
+      }
+    } catch {
+      // Config disappeared between detect and plan. Skip the edit.
+    }
+  }
+
+  const empty =
+    dependencyEdits.length === 0 &&
+    generatedFiles.length === 0 &&
+    nextConfigEdit === undefined
+
+  if (empty) {
+    return {
+      language: 'javascript',
+      serviceDir,
+      dependencyEdits: [],
+      entrypointEdits: [],
+      envEdits: [],
+      generatedFiles: [],
+      framework: 'next',
+    }
+  }
+
+  return {
+    language: 'javascript',
+    serviceDir,
+    dependencyEdits,
+    entrypointEdits: [],
+    envEdits: [OTEL_ENV],
+    generatedFiles,
+    framework: 'next',
+    ...(nextConfigEdit ? { nextConfigEdit } : {}),
+  }
+}
+
 async function plan(serviceDir: string): Promise<InstallPlan> {
   const pkg = await readPackageJson(serviceDir)
   const manifestPath = path.join(serviceDir, 'package.json')
@@ -280,6 +430,18 @@ async function plan(serviceDir: string): Promise<InstallPlan> {
     generatedFiles: [],
   }
   if (!pkg) return empty
+
+  // ADR-073 §1 — framework dispatch runs before entry resolution. When
+  // Next.js owns the boot path, `pkg.main` isn't load-bearing and the
+  // require/import injection would be ignored. The Next-flavored plan
+  // emits `instrumentation.{ts,js}` + `instrumentation.node.{ts,js}` at
+  // the package root instead.
+  if (hasNextDependency(pkg)) {
+    const nextConfig = await findNextConfig(serviceDir)
+    if (nextConfig) {
+      return planNext(serviceDir, pkg, manifestPath, nextConfig)
+    }
+  }
 
   // ADR-069 §2 — entry resolution before anything else. No entry → lib-only.
   const entryFile = await resolveEntry(serviceDir, pkg)
@@ -367,8 +529,8 @@ async function plan(serviceDir: string): Promise<InstallPlan> {
   }
 }
 
-// ADR-069 §7 — allowed write paths. Anything outside this set inside an
-// installer's apply phase is a contract violation.
+// ADR-069 §7 + ADR-073 §1 — allowed write paths. Anything outside this set
+// inside an installer's apply phase is a contract violation.
 function isAllowedWritePath(serviceDir: string, target: string): boolean {
   const rel = path.relative(serviceDir, target)
   if (rel.startsWith('..')) return false
@@ -376,6 +538,9 @@ function isAllowedWritePath(serviceDir: string, target: string): boolean {
   if (base === 'package.json') return true
   if (base === '.env.neat') return true
   if (/^otel-init\.(?:js|cjs|mjs|ts)$/.test(base)) return true
+  // ADR-073 §1 — Next framework files at the package root.
+  if (/^instrumentation(?:\.node)?\.(?:js|cjs|mjs|ts)$/.test(base)) return true
+  if (/^next\.config\.(?:js|mjs|ts)$/.test(base)) return true
   return false
 }
 
@@ -400,7 +565,8 @@ async function apply(installPlan: InstallPlan): Promise<ApplyResult> {
   if (
     installPlan.dependencyEdits.length === 0 &&
     installPlan.entrypointEdits.length === 0 &&
-    (installPlan.generatedFiles?.length ?? 0) === 0
+    (installPlan.generatedFiles?.length ?? 0) === 0 &&
+    installPlan.nextConfigEdit === undefined
   ) {
     return {
       serviceDir,
@@ -415,6 +581,7 @@ async function apply(installPlan: InstallPlan): Promise<ApplyResult> {
   for (const d of installPlan.dependencyEdits) allTargets.add(d.file)
   for (const e of installPlan.entrypointEdits) allTargets.add(e.file)
   for (const g of installPlan.generatedFiles ?? []) allTargets.add(g.file)
+  if (installPlan.nextConfigEdit) allTargets.add(installPlan.nextConfigEdit.file)
   for (const target of allTargets) {
     // Entry-point edits land in user source files, not the allowed set —
     // they're explicitly carved out below.
@@ -503,6 +670,23 @@ async function apply(installPlan: InstallPlan): Promise<ApplyResult> {
       await writeAtomic(ep.file, newRaw)
       writtenFiles.push(ep.file)
     }
+
+    // ── 4. Next.js config flag (ADR-073 §1) — only present on the Next
+    // path when the declared major is < 15 and the flag isn't already
+    // mentioned in the file. Best-effort regex insertion into the first
+    // config object literal; bails silently when the shape isn't
+    // recognisable so we never corrupt a user-customised config.
+    if (installPlan.nextConfigEdit) {
+      const target = installPlan.nextConfigEdit.file
+      const raw = originals.get(target)
+      if (raw !== undefined && !raw.includes('instrumentationHook')) {
+        const updated = injectInstrumentationHook(raw)
+        if (updated !== null) {
+          await writeAtomic(target, updated)
+          writtenFiles.push(target)
+        }
+      }
+    }
   } catch (err) {
     await rollback(installPlan, originals, createdFiles)
     throw err
@@ -552,6 +736,49 @@ async function rollback(
   await fs.writeFile(rollbackPath, lines.join('\n'), 'utf8')
 }
 
+// ADR-073 §1 — best-effort injection of `experimental.instrumentationHook:
+// true` into a next.config.{js,ts,mjs}. Returns the rewritten contents on
+// success, or null when the config shape isn't recognisable (in which case
+// the apply phase leaves the file alone — partial Next coverage is fine,
+// silent corruption of a user's config is not).
+//
+// Recognised shapes:
+//   - `module.exports = { ... }` (CJS)
+//   - `module.exports = { ... } satisfies NextConfig` (TS-via-CJS)
+//   - `export default { ... }` (ESM / TS)
+//   - `const nextConfig = { ... }; module.exports = nextConfig` (named CJS)
+//   - `const nextConfig: NextConfig = { ... }; export default nextConfig` (TS)
+export function injectInstrumentationHook(raw: string): string | null {
+  if (raw.includes('instrumentationHook')) return raw
+
+  // Strategy: find the first config object literal whose contents we can
+  // edit, then either merge into an existing `experimental: { ... }` block
+  // or insert a fresh `experimental: { instrumentationHook: true }` entry.
+  //
+  // We look for one of four anchors near a top-level `{` and splice from
+  // there. The regexes capture the `{` so we can splice right after it.
+  const anchors: Array<{ pattern: RegExp; label: string }> = [
+    { pattern: /(module\.exports\s*=\s*\{)/, label: 'cjs-default' },
+    { pattern: /(export\s+default\s*\{)/, label: 'esm-default' },
+    { pattern: /(?:const|let|var)\s+\w+(?:\s*:\s*[^=]+)?\s*=\s*(\{)/, label: 'named-config' },
+  ]
+
+  for (const { pattern } of anchors) {
+    const match = pattern.exec(raw)
+    if (!match) continue
+    const insertAfter = match.index + match[0].length
+    const before = raw.slice(0, insertAfter)
+    const after = raw.slice(insertAfter)
+    // Insert a leading newline so the injection sits on its own line and
+    // doesn't fight any existing trailing-comma style. Two-space indent
+    // covers most code-styled configs.
+    const injection = '\n  experimental: { instrumentationHook: true },'
+    return `${before}${injection}${after}`
+  }
+
+  return null
+}
+
 export const javascriptInstaller: Installer = {
   name: 'javascript',
   detect,
@@ -560,4 +787,4 @@ export const javascriptInstaller: Installer = {
 }
 
 // Re-exports used by the contract test surface.
-export { OTEL_INIT_HEADER }
+export { NEXT_INSTRUMENTATION_HEADER, OTEL_INIT_HEADER }
