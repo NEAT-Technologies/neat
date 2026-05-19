@@ -54,6 +54,7 @@ Bare arrays from REST endpoints are a contract violation. Why: an object can gro
 |------|--------|----------------|
 | `POST /graph/scan` | re-runs static-extraction pass | `{ nodesAdded, edgesAdded, durationMs }` |
 | `POST /policies/check` | dry-run policy evaluation; body `{ hypotheticalAction? }` | `{ allowed, violations: PolicyViolation[] }` |
+| `POST /snapshot` | merges an incoming snapshot from `neat sync` (ADR-074 §1); body `{ snapshot: SnapshotV3 }` | `{ project, nodesAdded, edgesAdded, nodeCount, edgeCount }` |
 
 The OTLP receiver lives on its own port (`:4318`) — not part of the REST API.
 

@@ -3,9 +3,9 @@ import path from 'node:path'
 import { Provenance, observedEdgeId } from '@neat.is/types'
 import type { NeatGraph } from './graph.js'
 
-const SCHEMA_VERSION = 3
+export const SCHEMA_VERSION = 3
 
-interface PersistedGraph {
+export interface PersistedGraph {
   schemaVersion: number
   exportedAt: string
   graph: ReturnType<NeatGraph['export']>
@@ -152,3 +152,9 @@ export function startPersistLoop(
     process.off('SIGINT', onSignal)
   }
 }
+
+// Snapshot merge (ADR-074 §1) lives in ingest.ts — that's the mutation-
+// authority boundary per the lifecycle contract (Rule 3 / ADR-030). The
+// merge is a form of ingestion: an external snapshot lands on the live graph
+// the same way an OTel span does, preserving the EXTRACTED + OBSERVED
+// coexistence contract along the way.

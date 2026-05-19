@@ -5,10 +5,12 @@ import type {
   ErrorEvent,
   FrontierNode,
   GraphEdge,
+  GraphNode,
   Policy,
   ServiceNode,
   StaleEvent,
 } from '@neat.is/types'
+import type { PersistedGraph } from './persist.js'
 import type { EvaluationContext as PolicyEvaluationContext } from './policy.js'
 import { canPromoteFrontier } from './policy.js'
 import {
@@ -893,4 +895,61 @@ export async function readErrorEvents(errorsPath: string): Promise<ErrorEvent[]>
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return []
     throw err
   }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Snapshot merge (ADR-074 §1)
+//
+// `neat sync` (local) and `neat sync --to <url>` (remote) feed snapshots into
+// a live graph through this helper. It lives in ingest.ts because mutation
+// authority sits with ingest + extract per the lifecycle contract (ADR-030);
+// the merge is ingestion of an external snapshot, no different in shape from
+// the way handleSpan ingests an OTel span.
+//
+// The merge preserves EXTRACTED + OBSERVED coexistence per Rule 2 — each
+// provenance variant has its own edge id, so the incoming EXTRACTED edges
+// can't stomp the daemon's accumulated OBSERVED edges and vice versa. Rule of
+// thumb: incoming wins for nodes/edges the live graph hasn't seen yet;
+// everything already present keeps its current attributes.
+// ──────────────────────────────────────────────────────────────────────────
+
+export interface MergeSnapshotResult {
+  nodesAdded: number
+  edgesAdded: number
+}
+
+export function mergeSnapshot(
+  graph: NeatGraph,
+  snapshot: PersistedGraph,
+): MergeSnapshotResult {
+  const exported = snapshot.graph as {
+    nodes?: Array<{ key: string; attributes?: GraphNode }>
+    edges?: Array<{ key?: string; source: string; target: string; attributes?: GraphEdge }>
+  }
+
+  let nodesAdded = 0
+  let edgesAdded = 0
+
+  for (const node of exported.nodes ?? []) {
+    if (graph.hasNode(node.key)) continue
+    if (!node.attributes) continue
+    graph.addNode(node.key, node.attributes)
+    nodesAdded++
+  }
+
+  for (const edge of exported.edges ?? []) {
+    const attrs = edge.attributes
+    if (!attrs) continue
+    const id = edge.key ?? attrs.id
+    if (!id) continue
+    if (graph.hasEdge(id)) continue
+    // Skip when either endpoint is missing — can happen if the snapshot
+    // names a node the live graph already evicted and the incoming nodes
+    // array didn't include.
+    if (!graph.hasNode(edge.source) || !graph.hasNode(edge.target)) continue
+    graph.addEdgeWithKey(id, edge.source, edge.target, attrs)
+    edgesAdded++
+  }
+
+  return { nodesAdded, edgesAdded }
 }

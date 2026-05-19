@@ -57,13 +57,18 @@ export class TransportError extends Error {
   }
 }
 
-export function createHttpClient(baseUrl: string): HttpClient {
+export function createHttpClient(baseUrl: string, bearerToken?: string): HttpClient {
   const root = baseUrl.replace(/\/$/, '')
+  const authHeader = bearerToken && bearerToken.length > 0
+    ? { authorization: `Bearer ${bearerToken}` }
+    : {}
   return {
     async get<T>(path: string): Promise<T> {
       let res: Response
       try {
-        res = await fetch(`${root}${path}`)
+        res = await fetch(`${root}${path}`, {
+          headers: { ...authHeader },
+        })
       } catch (err) {
         throw new TransportError(
           `cannot reach neat-core at ${root}: ${(err as Error).message}`,
@@ -84,7 +89,7 @@ export function createHttpClient(baseUrl: string): HttpClient {
       try {
         res = await fetch(`${root}${path}`, {
           method: 'POST',
-          headers: { 'content-type': 'application/json' },
+          headers: { 'content-type': 'application/json', ...authHeader },
           body: JSON.stringify(body),
         })
       } catch (err) {
@@ -770,4 +775,49 @@ export function exitCodeForError(err: unknown): number {
   if (err instanceof TransportError) return 3
   if (err instanceof HttpError) return 1
   return 1
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Snapshot push (ADR-074 §1)
+//
+// `neat sync` (local + --to <url>) feeds the freshly extracted snapshot into
+// either the local daemon or a remote one. The endpoint is dual-mounted via
+// registerRoutes — default project lands at /snapshot, named projects at
+// /projects/:project/snapshot. The helper goes through the shared
+// HttpClient so the verb stays on the same network path as every query verb.
+// ──────────────────────────────────────────────────────────────────────────
+
+export interface PushSnapshotInput {
+  baseUrl: string
+  token: string | undefined
+  project: string
+  snapshot: unknown
+}
+
+export interface PushSnapshotResult {
+  project: string
+  nodesAdded: number
+  edgesAdded: number
+  nodeCount: number
+  edgeCount: number
+}
+
+export function createSnapshotPushClient(
+  baseUrl: string,
+  token: string | undefined,
+): HttpClient {
+  return createHttpClient(baseUrl, token && token.length > 0 ? token : undefined)
+}
+
+export async function pushSnapshotToRemote(
+  input: PushSnapshotInput,
+): Promise<PushSnapshotResult> {
+  const client = createSnapshotPushClient(input.baseUrl, input.token)
+  if (typeof client.post !== 'function') {
+    throw new Error('HttpClient does not support POST — required for snapshot push')
+  }
+  return client.post<PushSnapshotResult>(
+    `/projects/${encodeURIComponent(input.project)}/snapshot`,
+    { snapshot: input.snapshot },
+  )
 }
