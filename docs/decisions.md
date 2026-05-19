@@ -2550,3 +2550,70 @@ The daemon treats `broken` as a recoverable, observable state. Spans for broken 
 - **User-configurable aliases.** No `aliases:` field on the registry entry. The token-aware match covers the cases this ADR can defend in the current corpus.
 
 **First application.** v0.3.7.
+
+---
+
+## ADR-073 — One-command CLI, `neat deploy`, and delegated auth at the daemon boundary
+
+**Date:** 2026-05-19
+**Status:** Accepted. Extends ADR-046 (`neat init`), ADR-047 (SDK install), ADR-049 (daemon), ADR-051 (frontend-facing API), ADR-052 (publish system), ADR-058 (web debugging surface), ADR-069 / ADR-070 (entry detection).
+
+NEAT's surface area at the CLI gains a one-command shape and a deploy verb, and the daemon boundary gains operator-delegated auth. A developer reaches a live dashboard from a cold clone in under a minute via `neat <path>` (or `npx neat.is <path>`). Operators moving NEAT from laptop to a hosted target generate substrate-appropriate artifacts via `neat deploy` and protect the public endpoints with a bearer token of their own choosing. The localhost-default `.env.neat` from ADR-047 holds — production overrides ride the OTel SDK's existing env-precedence rules through whichever deploy platform the operator picked.
+
+**Context.** Through v0.3.7 the path from clone to dashboard is a sequence: `npm install -g @neat.is/core`, `neat init <path>`, `neatd start`, open the browser, find the project. Each step is documented and each step is one more thing a first-time operator can stall on. The orchestrator collapses the sequence into one verb without removing any of the underlying primitives — `neat init`, `neatd start`, and the SDK installer remain individually addressable, and the patch-by-default rule on `init` (ADR-046) stays intact. The hosted-target side of the story is the symmetric gap: today `neatd start` is documented for a laptop; a `neat deploy` verb makes the substrate explicit and emits the artifacts the operator pastes into Docker or systemd. Auth at the daemon boundary stays deferred because the operator already chose a deployment substrate that knows how to bind ports and rotate secrets — NEAT delegates rather than re-invents.
+
+**Decision.**
+
+1. **`neat <path>` (no subcommand) is the one-command orchestrator.** When the first positional argument resolves to a directory and does not match a registered verb, the CLI dispatches to the orchestrator path. The orchestrator runs, in order: discovery + extraction (per [`static-extraction.md`](./contracts/static-extraction.md)), registration (per [`project-registry.md`](./contracts/project-registry.md)), SDK install **apply** (per [`sdk-install.md`](./contracts/sdk-install.md)), daemon spawn (per [`daemon.md`](./contracts/daemon.md)), browser open against the web UI (per [`web-bootstrap.md`](./contracts/web-bootstrap.md)), and a single-screen summary that lists what landed and what the operator pastes into a deploy platform when they move beyond localhost. Defaults: instrument yes, open dashboard yes. Overrides: `--no-instrument` skips the SDK apply step; `--no-open` skips the browser launch. `npx neat.is <path>` is the documented shorthand and resolves through the same dispatch — the entry point in `@neat.is/cli` forwards to the same orchestrator.
+
+   The orchestrator is distinct from `neat init`. `neat init` keeps its patch-by-default contract (ADR-046 §5): no manifest mutation without `--apply`. The orchestrator runs apply unconditionally — the user's intent in typing `neat <path>` with no subcommand is "make this work end-to-end," which is a different consent shape than `neat init`'s "show me what you would do." The two verbs share their underlying primitives but not their default-mutate posture.
+
+2. **`neat deploy` is the second top-level verb.** Emits deployment artifacts for hosted targets via substrate detection. Detection order:
+
+   1. **Docker present** (a `docker` binary on PATH that responds to `docker version` within 2 seconds) → emit a `docker-compose.yml` snippet wiring the daemon image, the OTLP receiver port (`:4318`), the REST port (`:8080`), and the web UI port (`:6328`). The snippet declares `NEAT_AUTH_TOKEN` as a required env-var.
+   2. **Raw machine** (no Docker, but the orchestrator is running on a systemd-aware host — `systemctl --version` resolves) → emit a `neatd.service` systemd unit that runs `neatd start --foreground` under a service user, with `NEAT_AUTH_TOKEN` in `EnvironmentFile=/etc/neat/neatd.env`.
+   3. **Fallback** (no Docker, no systemd) → emit a single `docker run` snippet that the operator can adapt to whatever orchestrator they have. The snippet still names the bearer-token env-var explicitly.
+
+   In every branch `neat deploy` auto-generates a fresh `NEAT_AUTH_TOKEN` (32-byte cryptographically random, base64url-encoded) and prints it once. The operator pastes it into their deploy platform's secret store. The artifact written to disk references the env-var name but never embeds the token value.
+
+   `neat deploy` also prints — verbatim, ready to paste — the OTel env-vars block the operator's application services need: `OTEL_EXPORTER_OTLP_ENDPOINT=https://<host>:4318`, `OTEL_EXPORTER_OTLP_HEADERS=Authorization=Bearer <token>`, `OTEL_SERVICE_NAME=<service>`. The token in the printed block matches the freshly generated `NEAT_AUTH_TOKEN` unless `--otel-token <value>` overrides it (see §4).
+
+3. **Auth at the daemon boundary is delegated to the operator via `NEAT_AUTH_TOKEN`.** The token is the daemon-side configuration surface; nothing about NEAT issues, rotates, or distributes it. Behaviour at startup:
+
+   - `NEAT_AUTH_TOKEN` **set** → the REST host installs middleware that requires `Authorization: Bearer <token>` on every request under `/api/*` and on the SSE stream at `/events` (per ADR-051). Missing header → `401 Unauthorized` with a JSON error body. Wrong token → `401`. Constant-time string comparison only. Web UI requests (loaded by the bundled UI on the same origin) carry the token via the same header — the UI reads it from an env-injected config payload served at `/api/config` and short-lived enough that the operator can rotate.
+   - `NEAT_AUTH_TOKEN` **unset** → the daemon refuses to bind on any address other than `127.0.0.1`. If the operator set `NEAT_BIND_HOST` (or any future bind override) to a value that is not a loopback address, `neatd start` exits non-zero with a clear error: `NEAT_AUTH_TOKEN is required when binding outside loopback`. Loopback-only binds remain unauthenticated — the laptop dev experience does not regress.
+   - The middleware is mounted before any project router. There is no per-project bypass and no read-only/write-only split — the bearer protects the entire `/api/*` and `/events` surface uniformly. Lifecycle endpoints (`/healthz`, `/readyz`) stay unauthenticated for orchestrator probes.
+
+4. **OTLP ingest at `:4318` honors the same bearer.** The OTLP HTTP receiver checks `Authorization: Bearer <token>` against `NEAT_AUTH_TOKEN` by default. For rotation independence the operator may set `NEAT_OTEL_TOKEN` — when set, the OTLP receiver validates against that value instead, while the REST host keeps validating against `NEAT_AUTH_TOKEN`. The two tokens may be rotated on independent schedules. When neither is set, OTLP ingest is unauthenticated and inherits the loopback-only refusal from §3.
+
+5. **`.env.neat` keeps the localhost endpoint default; production overrides through OTel SDK env precedence.** The SDK installer (ADR-047 §3) continues to write `OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318` to each instrumented service's `.env.neat`. Production traffic redirects through whichever deploy platform the operator picked: setting `OTEL_EXPORTER_OTLP_ENDPOINT` and `OTEL_EXPORTER_OTLP_HEADERS` on the platform's env dashboard overrides the file-based default per the OTel SDK's documented precedence (process env > `.env`-loaded vars on most runtimes). NEAT does not codegen a second `.env.neat` for prod and does not edit the operator's deploy-platform config. The orchestrator's summary surfaces the exact override block on every init run — same block `neat deploy` prints in §2 — so the operator never has to compose the headers by hand.
+
+6. **`neat-out/` is appended to `<path>/.gitignore` automatically during init.** When the orchestrator (or `neat init`) writes the snapshot under `<projectDir>/neat-out/`, it also ensures `.gitignore` at the project root contains a `neat-out/` line. Idempotent: if the line already exists (any leading/trailing whitespace; exact match against `neat-out/` or `neat-out`), no write occurs. If `.gitignore` is missing entirely, it is created with the single line. The append is governed by the same patch-vs-apply distinction as the SDK installer — `neat init` without `--apply` lists the planned `.gitignore` write in the dry-run summary; `neat init --apply` and `neat <path>` execute it. This is the one file outside `neat-out/` itself that the init flow may modify without an explicit `--apply` opt-in, on the grounds that an un-ignored `neat-out/` is a foot-gun the operator never wants — the snapshot leaks into git history within one commit.
+
+**Authority.**
+
+- `packages/core/src/cli.ts` — bare-path dispatch, `neat deploy` verb, summary-block renderer.
+- `packages/core/src/server.ts` — bearer middleware on `/api/*` and `/events`, loopback-only refusal when `NEAT_AUTH_TOKEN` is unset.
+- `packages/core/src/daemon.ts` — pre-bind validation, OTLP bearer wiring.
+- `packages/core/src/otel.ts` — `NEAT_OTEL_TOKEN` precedence over `NEAT_AUTH_TOKEN` at the OTLP receiver.
+- `packages/core/src/installers/javascript.ts` — the `.env.neat` localhost-default and the override-block emission already live here; no shape change.
+- `packages/core/src/registry.ts` — the `.gitignore` append helper composes onto the existing init flow.
+
+**Enforcement.** New `describe('ADR-073 — one-command CLI + deployment-target + delegated auth')` block in `packages/core/test/audits/contracts.test.ts`. Assertions land alongside their implementing PRs; pre-implementation work surfaces as `it.todo`. Six sections, one assertion family each:
+
+1. Bare-path dispatch resolves a directory argument to the orchestrator; instrument and open default-on; `--no-instrument` and `--no-open` skip their respective steps.
+2. `neat deploy` substrate detection follows Docker → systemd → fallback order; every branch generates a fresh `NEAT_AUTH_TOKEN`; the OTel override block prints with the matching token.
+3. `NEAT_AUTH_TOKEN` set → bearer required on `/api/*` and `/events`. Unset + non-loopback bind → `neatd start` exits non-zero with the documented error string.
+4. OTLP `:4318` honors `NEAT_AUTH_TOKEN`; `NEAT_OTEL_TOKEN` when set overrides for the OTLP receiver only.
+5. `.env.neat` continues to write `OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318`; the orchestrator summary contains the documented override block format.
+6. `neat-out/` line is present in `.gitignore` after init; running init twice does not duplicate the line; `.gitignore` is created when absent.
+
+**Out of scope.**
+
+- **Token issuance / rotation tooling.** NEAT prints a token at `neat deploy` time and validates against it at the daemon boundary. Rotation cadence, secret-store integration, and revocation surfaces are the operator's deploy platform's job — that is the point of delegation.
+- **Mutual TLS or non-bearer auth.** mTLS, OIDC, SPIFFE, and per-user RBAC are post-MVP. The single shared bearer is the minimum surface that closes the public-bind foot-gun without growing an auth subsystem.
+- **`neat deploy` to a managed cloud target.** A future ADR may add `neat deploy --target railway` / `--target fly` / `--target aws` flavours that emit substrate-specific manifests beyond plain Docker / systemd. v0.3.8 ships the three baseline branches.
+- **Multi-tenant project ACLs.** The bearer protects the daemon's full surface uniformly; per-project access controls open as their own ADR when the multi-tenant operator story surfaces.
+- **`NEAT_BIND_HOST` itself.** The refusal-to-bind logic references a bind-host override but does not codify the env-var name. The existing `PORT` / `OTEL_PORT` overrides from ADR-063 stay as the documented surface in v0.3.8; a host override may follow in a successor ADR.
+
+**First application.** v0.3.8.
