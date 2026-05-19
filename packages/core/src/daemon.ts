@@ -397,6 +397,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<DaemonHandl
         projects: registry,
         authToken: auth.authToken,
         trustProxy: auth.trustProxy,
+        publicRead: auth.publicRead,
       })
       restAddress = await restApp.listen({ port: restPort, host })
       console.log(`neatd: REST listening on ${restAddress}`)

@@ -88,6 +88,7 @@ async function main(): Promise<void> {
     projects: registry,
     authToken: auth.authToken,
     trustProxy: auth.trustProxy,
+    publicRead: auth.publicRead,
   })
   await app.listen({ port, host })
   console.log(`neat-core listening on http://${host}:${port}`)

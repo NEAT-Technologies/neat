@@ -62,6 +62,10 @@ export interface BuildApiOptions {
   // ADR-073 §3 — when the operator runs behind a reverse proxy that already
   // authenticates the request, the daemon-side check is bypassed.
   trustProxy?: boolean
+  // ADR-073 §3 amendment — public-read mode. When `true`, GET / HEAD / OPTIONS
+  // bypass the bearer check; writes still require it. OTLP ingest is gated
+  // independently and is unaffected by this flag.
+  publicRead?: boolean
 }
 
 interface SerializedGraph {
@@ -599,8 +603,22 @@ export async function buildApi(opts: BuildApiOptions): Promise<FastifyInstance> 
 
   // ADR-073 §3 — bearer middleware sits ahead of every route handler. No-op
   // when `authToken` is undefined; loopback-only callers (the laptop dev
-  // path) hit that branch.
-  mountBearerAuth(app, { token: opts.authToken, trustProxy: opts.trustProxy })
+  // path) hit that branch. `publicRead` opens GET / HEAD / OPTIONS to
+  // anonymous callers while keeping writes gated.
+  mountBearerAuth(app, {
+    token: opts.authToken,
+    trustProxy: opts.trustProxy,
+    publicRead: opts.publicRead,
+  })
+
+  // ADR-073 §3 amendment — `/api/config` is always unauthenticated. The web
+  // shell hits it before any bearer-carrying request to learn which mode the
+  // daemon is in. Exposes exactly two booleans — `publicRead` and
+  // `authProxy` — and nothing else; no project list, no version, no env.
+  app.get('/api/config', async () => ({
+    publicRead: opts.publicRead === true,
+    authProxy: opts.trustProxy === true,
+  }))
 
   const startedAt = opts.startedAt ?? Date.now()
   const registry = buildLegacyRegistry(opts)
