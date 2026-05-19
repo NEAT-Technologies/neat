@@ -290,11 +290,8 @@ export function StatusBar({ project, graphData }: StatusBarProps) {
         <span className="v">{sseState}</span>
       </div>
       <EnvironmentIndicator />
-<<<<<<< HEAD
-      <SignOutButton />
-=======
       <PublicReadIndicator />
->>>>>>> 9d49b46 (StatusBar surfaces a public-read badge when the daemon advertises it)
+      <SignOutButton />
       <div className="st-item">
         <span className="k">nodes</span>
         <span className="v" id="st-nodes">{nodeCount}</span>

@@ -28,7 +28,7 @@ let inflight: Promise<DaemonAuthConfig> | null = null
 
 const DEFAULT_CONFIG: DaemonAuthConfig = { publicRead: false, authProxy: false }
 
-async function loadConfig(): Promise<DaemonAuthConfig> {
+export async function loadDaemonAuthConfig(): Promise<DaemonAuthConfig> {
   if (cached) return cached
   if (inflight) return inflight
   inflight = (async () => {
@@ -84,7 +84,7 @@ export function useDaemonAuthConfig(): { config: DaemonAuthConfig; ready: boolea
       return
     }
     let cancelled = false
-    void loadConfig().then((cfg) => {
+    void loadDaemonAuthConfig().then((cfg) => {
       if (cancelled) return
       setConfig(cfg)
       setReady(true)

@@ -6492,7 +6492,9 @@ describe('Web shell multi-project routing (ADR-057)', () => {
 
   it('AppShell.tsx falls back to first entry from GET /projects when registry is non-empty (ADR-057 #2.3)', () => {
     const src = readSrc(APP_SHELL)
-    expect(src).toMatch(/fetch\(['"]\/api\/projects['"]\)/)
+    // `authedFetch` from ADR-073 §3 is also acceptable — it's a thin wrapper
+    // around `fetch` that attaches the bearer when one is in storage.
+    expect(src).toMatch(/(authed)?[Ff]etch\(['"]\/api\/projects['"]\)/)
     expect(src).toMatch(/list\[0\]/)
   })
 
@@ -6532,8 +6534,15 @@ describe('Web shell multi-project routing (ADR-057)', () => {
   })
 
   it('Every API proxy route under packages/web/app/api/** forwards `project` (ADR-057 #5)', () => {
+    // /api/config is the daemon's auth-mode negotiation surface (ADR-073 §3a)
+    // — global to the daemon, not project-scoped. Always unauthenticated,
+    // returns exactly { publicRead, authProxy } regardless of which project
+    // the dashboard happens to be viewing.
+    const projectAgnosticRoutes = new Set(['api/config/route.ts'])
     const offenders: string[] = []
     for (const f of walkRoutes(API_DIR)) {
+      const rel = f.split('app/').pop() ?? f
+      if (projectAgnosticRoutes.has(rel)) continue
       const src = readSrc(f)
       if (!/searchParams\.get\(['"]project['"]\)/.test(src)) {
         offenders.push(`${f} does not read project from query string`)
@@ -6549,7 +6558,9 @@ describe('Web shell multi-project routing (ADR-057)', () => {
 
   it('Project switcher in TopBar.tsx uses GET /projects and calls setProject(name) (ADR-057 #7)', () => {
     const src = readSrc(TOPBAR)
-    expect(src).toMatch(/fetch\(['"]\/api\/projects['"]\)/)
+    // `authedFetch` is the bearer-aware wrapper from ADR-073 §3; either form
+    // satisfies the contract.
+    expect(src).toMatch(/(authed)?[Ff]etch\(['"]\/api\/projects['"]\)/)
     expect(src).toMatch(/onProjectChange\(/)
   })
 

@@ -1,6 +1,7 @@
 'use client'
 
 import { trackedFetch } from './proxy-client'
+import { loadDaemonAuthConfig } from './public-read-mode'
 
 const TOKEN_KEY = 'neat:authToken'
 
@@ -43,6 +44,13 @@ export async function authedFetch(
   const res = await trackedFetch(url, { ...init, headers })
 
   if (res.status === 401 && typeof window !== 'undefined') {
+    // ADR-073 §3a — public-read deployments serve anonymous GETs; a 401 on
+    // a read just means the operator hit a write endpoint without the
+    // bearer. Surface the 401 to the caller instead of bouncing them to
+    // /login, which they have no reason to visit.
+    const cfg = await loadDaemonAuthConfig()
+    if (cfg.publicRead) return res
+
     clearToken()
     const path = window.location.pathname
     if (path !== '/login') {
