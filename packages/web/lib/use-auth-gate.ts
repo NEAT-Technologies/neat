@@ -10,8 +10,8 @@ import { loadDaemonAuthConfig } from './public-read-mode'
  * `NEXT_PUBLIC_NEAT_AUTH_PROXY=true` (ADR-073 §3 — the bearer is delegated to
  * the deploy platform).
  *
- * Public-read reference deployments (ADR-073 §3a) also skip the redirect —
- * the dashboard renders read-only without forcing a login. The negotiation
+ * Public-read reference deployments (ADR-073 §3a) also skip the redirect.
+ * The dashboard renders read-only without forcing a login. The negotiation
  * happens against the daemon's `/api/config` endpoint and is cached after
  * the first call, so the latency hit is paid once per session.
  *

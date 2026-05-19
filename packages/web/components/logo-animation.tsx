@@ -80,11 +80,6 @@ export function LogoAnimation() {
         <div className="logo-letter-face" ref={letterRef} data-testid="logo-letter">N</div>
       </div>
 
-      <span className="logo-pip logo-pip-top" />
-      <span className="logo-pip logo-pip-right" />
-      <span className="logo-pip logo-pip-bottom" />
-      <span className="logo-pip logo-pip-left" />
-
       <div className="logo-label">Network Environment Architecture Tools</div>
 
       <style jsx>{`
@@ -160,23 +155,6 @@ export function LogoAnimation() {
         @keyframes logo-flip-in {
           from { transform: rotateY(-90deg); opacity: 0.2; }
           to   { transform: rotateY(0deg);   opacity: 1; }
-        }
-
-        .logo-pip {
-          position: absolute;
-          width: 6px;
-          height: 6px;
-          background: #fff;
-          animation: logo-pip-pulse 8s linear infinite;
-        }
-        .logo-pip-top    { top: 2px;    left: 50%; transform: translateX(-50%) rotate(45deg); }
-        .logo-pip-right  { right: 2px;  top: 50%;  transform: translateY(-50%) rotate(45deg); }
-        .logo-pip-bottom { bottom: 2px; left: 50%; transform: translateX(-50%) rotate(45deg); }
-        .logo-pip-left   { left: 2px;   top: 50%;  transform: translateY(-50%) rotate(45deg); }
-
-        @keyframes logo-pip-pulse {
-          0%, 100% { opacity: 1; }
-          50%      { opacity: 0.3; }
         }
 
         .logo-scan {

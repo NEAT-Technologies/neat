@@ -30,5 +30,15 @@ npm-debug.log*
 # test
 coverage/
 
-# docker save artifacts — image tarballs are big and never belong in the tree
+# docker save artifacts; image tarballs are big and never belong in the tree
 *.tar.gz
+
+# maintainer-local working docs (kept on disk, not tracked)
+docs/decisions.md
+docs/adr/
+docs/plans/
+docs/audits/
+docs/milestones.md
+docs/frontend-divergence-suggestions.md
+docs/v0.x-proposals.md
+docs/railway.md
