@@ -6492,7 +6492,7 @@ describe('Web shell multi-project routing (ADR-057)', () => {
 
   it('AppShell.tsx falls back to first entry from GET /projects when registry is non-empty (ADR-057 #2.3)', () => {
     const src = readSrc(APP_SHELL)
-    expect(src).toMatch(/fetch\(['"]\/api\/projects['"]\)/)
+    expect(src).toMatch(/(?:authedFetch|fetch)\(['"]\/api\/projects['"]\)/)
     expect(src).toMatch(/list\[0\]/)
   })
 
@@ -6549,7 +6549,7 @@ describe('Web shell multi-project routing (ADR-057)', () => {
 
   it('Project switcher in TopBar.tsx uses GET /projects and calls setProject(name) (ADR-057 #7)', () => {
     const src = readSrc(TOPBAR)
-    expect(src).toMatch(/fetch\(['"]\/api\/projects['"]\)/)
+    expect(src).toMatch(/(?:authedFetch|fetch)\(['"]\/api\/projects['"]\)/)
     expect(src).toMatch(/onProjectChange\(/)
   })
 

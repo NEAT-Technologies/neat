@@ -1,125 +1,64 @@
 # NEAT
 
-> **⚠️ Work in progress.** This is an MVP under active development. A handful of architectural choices were made for shipping speed, not for permanence.
-
 [![CI](https://github.com/NEAT-Technologies/Neat/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/NEAT-Technologies/Neat/actions/workflows/ci.yml)
-[![License](https://img.shields.io/github/license/NEAT-Technologies/Neat)](BSL)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue)](./LICENSE)
 [![Release](https://img.shields.io/github/v/release/NEAT-Technologies/Neat)](https://github.com/NEAT-Technologies/Neat/releases)
 [![Website](https://img.shields.io/badge/website-neat.is-black)](https://neat.is)
 
-A unified runtime that holds a live semantic graph of your code, your infrastructure, and what's happening in production. Query it. Assert policies against it. Point agents at it.
+A live semantic graph of your code, your infrastructure, and what's actually happening in production. Query it. Assert policies against it. Point agents at it.
 
-The story behind it: https://neat.is/blog/architecture-is-all-you-need
+## One command
 
----
+```bash
+npx neat.is
+```
+
+That single command, run in any project directory:
+
+1. Walks the tree and builds a static graph from source (tree-sitter on JavaScript, TypeScript, and Python; `package.json`, Dockerfile, env, and config files).
+2. Detects the framework (Next.js today; Remix / SvelteKit / Nuxt / Astro land in v0.3.9) and injects OpenTelemetry auto-instrumentation at the right entry point.
+3. Spawns a daemon in the background on `:8080` (REST), `:4318` (OTLP HTTP), `:6328` (web dashboard).
+4. Opens the dashboard in your browser.
+5. Prints the top compat violations, divergences, and uninstrumented services to the terminal.
+
+Total time from a clean clone to a working dashboard: under a minute.
 
 ## What it does
 
 NEAT keeps a working model of your system up to date from two streams at once:
 
-- **Static analysis** of source files, `package.json`, and yaml/env config.
+- **Static analysis** of source files, `package.json`, and yaml / env config.
 - **Runtime telemetry** from OpenTelemetry spans.
 
-Every edge is tagged with a `provenance` (EXTRACTED, INFERRED, OBSERVED, STALE, FRONTIER) so a consumer reading the graph knows exactly how much weight an individual claim deserves. The full model is documented in [`PROVENANCE.md`](./PROVENANCE.md).
+Every edge in the graph carries a `provenance` tag so a consumer reading the graph knows exactly how much weight an individual claim deserves:
 
-The graph is exposed to AI agents through nine MCP tools: `get_root_cause`, `get_blast_radius`, `get_dependencies`, `get_observed_dependencies`, `get_incident_history`, `semantic_search`, `get_graph_diff`, `get_recent_stale_edges`, `check_policies`.
+- `EXTRACTED` from source. No clock decay.
+- `OBSERVED` from a span. Carries `lastObserved` and `callCount`.
+- `INFERRED` by the trace stitcher where OTel coverage has gaps. Confidence is capped.
+- `STALE` because runtime stopped speaking. Preserves the original `lastObserved`.
 
----
-
-## Quickstart — reproduce the demo locally in under ten minutes
-
-The demo wires up two Node services in front of a Postgres 15 database. `service-b` is locked to `pg` 7.4.0, which is too old to negotiate SCRAM auth — every call fails at runtime. NEAT's job is to follow that failure back through the graph and pin the cause two hops upstream.
-
-### 1. Clone and install
-
-```bash
-git clone https://github.com/NEAT-Technologies/Neat
-cd Neat
-npm install
-npm run build
-```
-
-Node 20.x is required. If you use nvm, `nvm use` will pick up `.nvmrc`.
-
-### 2. Start the stack
-
-```bash
-docker compose up --build
-```
-
-Five containers come up: `payments-db` (Postgres 15), `service-a`, `service-b`, `otel-collector`, and `neat-core`. Spans flow from the collector into core on `:4318`. Core's REST API listens on `:8080`.
-
-### 3. Generate traffic
-
-```bash
-for i in {1..10}; do curl -s localhost:3000/data; done
-```
-
-Every one of those requests will 500. That's the point — the failures are what feed the graph.
-
-### 4. Confirm the graph saw it
-
-```bash
-curl -s localhost:8080/graph | jq '.edges[] | select(.id | contains("OBSERVED"))'
-curl -s localhost:8080/incidents | jq '.[0]'
-```
-
-You should find an `OBSERVED` `CALLS` edge from `service:service-a` to `service:service-b`, an `INFERRED` `CONNECTS_TO` edge from `service:service-b` to `database:payments-db` (the trace stitcher backfills the gap left by the missing pg auto-instrumentation — `docs/decisions.md` ADR-014 has the reasoning), and an incident attributed to `database:payments-db`.
-
-### 5. Wire NEAT into Claude Code
-
-```bash
-claude mcp add neat -- node "$(pwd)/packages/mcp/dist/index.cjs"
-```
-
-Or, if you'd rather edit `~/.claude/settings.json` by hand:
-
-```json
-{
-  "mcpServers": {
-    "neat": {
-      "command": "node",
-      "args": ["/absolute/path/to/Neat/packages/mcp/dist/index.cjs"],
-      "env": { "NEAT_CORE_URL": "http://localhost:8080" }
-    }
-  }
-}
-```
-
-### 6. Ask Claude
-
-In any Claude Code session:
-
-> **Why is payments-db failing?**
-
-What you'll see back:
-
-```
-Root cause identified: service:service-b.
-PostgreSQL 14+ requires scram-sha-256 auth by default; pg < 8.0.0 only speaks md5.
-
-Traversal path: database:payments-db ← service:service-b ← service:service-a
-Edge provenances: INFERRED, OBSERVED
-Confidence: 0.70
-
-Recommended fix: Upgrade service-b pg driver to >= 8.0.0
-```
-
-Confidence lands at 0.7 because one hop on the path (`CONNECTS_TO`) is INFERRED — pg 7.4.0 is too old for OTel's pg instrumenter, so the stitcher reaches into the static graph to fill the gap. Run the same demo with a modern driver and every edge is OBSERVED, confidence 1.0.
-
----
+The graph is exposed to AI agents through ten MCP tools: `get_root_cause`, `get_blast_radius`, `get_dependencies`, `get_observed_dependencies`, `get_incident_history`, `get_divergences`, `get_graph_diff`, `get_recent_stale_edges`, `check_policies`, and `semantic_search`.
 
 ## CLI
 
-`neat init <path>` walks a directory, builds the static graph, and writes a snapshot:
+The same `neat` binary handles every verb. After a global install (`npm i -g neat.is`) or via `npx neat.is`:
 
-```bash
-node packages/core/dist/cli.cjs init ./demo
+```
+neat <path>              orchestrator: extract, instrument, spawn daemon, open dashboard
+neat init <path>         extract only; patch-by-default, --apply to write
+neat watch <path>        keep the graph live as files change
+neat deploy              emit deployment artifacts for a hosted target
+neat sync --to <url>     push the local EXTRACTED snapshot to a remote daemon (v0.3.9)
+neat root-cause <id>     walk inbound edges to find what broke first
+neat blast-radius <id>   BFS outbound; what would break if this node dies
+neat dependencies <id>   transitive outbound dependencies
+neat divergences         where EXTRACTED and OBSERVED disagree
+neat incidents           recent error events
+neat policies            current policy violations
+neat search <query>      semantic match on node names and ids
 ```
 
-Output is a per-type breakdown of nodes and edges plus anything the compat matrix flagged as incompatible. The snapshot lands at `<path>/neat-out/graph.json` unless `NEAT_OUT_PATH` says otherwise.
-
----
+Every query verb honors `--json` and `--project <name>`. Exit codes branch on success (0), server error (1), misuse (2), and daemon unreachable (3).
 
 ## Run NEAT on a server
 
@@ -134,9 +73,14 @@ docker run -d --name neat \
   ghcr.io/neat-technologies/neat:latest
 ```
 
-`NEAT_AUTH_TOKEN` is required on every public interface — the daemon refuses to bind on non-loopback addresses without one. REST and SSE callers send it in `Authorization: Bearer <token>`; OTel exporters send the same header. Rotate the OTLP token independently by setting `NEAT_OTEL_TOKEN`.
+`NEAT_AUTH_TOKEN` is required on every public interface. The daemon refuses to bind on non-loopback addresses without one. REST and SSE callers send the token in `Authorization: Bearer <token>`; OTel exporters send the same header. Rotate the OTLP token independently with `NEAT_OTEL_TOKEN`.
 
----
+Easier path: `neat deploy` generates the token, writes a `docker-compose.neat.yml`, and prints the env block your application's deploy platform needs:
+
+```
+OTEL_EXPORTER_OTLP_ENDPOINT=https://<your-host>:4318
+OTEL_EXPORTER_OTLP_HEADERS=Authorization=Bearer <generated-token>
+```
 
 ## Behind a reverse proxy
 
@@ -157,38 +101,54 @@ neat.example.com {
 
 Then `docker run … -e NEAT_AUTH_TOKEN=… -e NEAT_AUTH_PROXY=true …` and let Caddy gate the public surface.
 
----
+## Wire NEAT into Claude Code
+
+```bash
+claude mcp add neat -- neat-mcp
+```
+
+Or edit `~/.claude/settings.json` by hand:
+
+```json
+{
+  "mcpServers": {
+    "neat": {
+      "command": "neat-mcp",
+      "env": { "NEAT_CORE_URL": "http://localhost:8080" }
+    }
+  }
+}
+```
+
+In any Claude Code session, ask: *"Why is checkout-svc failing?"* NEAT walks the graph and answers with a traversal path, edge provenances, a confidence score, and a recommended fix.
 
 ## Repository layout
 
 ```
 packages/
-  types/   shared Zod schemas — node, edge, event, result types
-  core/    graph engine, tree-sitter extraction, OTel ingest, REST API, neat CLI
-  mcp/     stdio MCP server exposing nine tools to AI agents
-  web/     Next.js shell — wordmark + /api/health (dashboard is post-MVP)
-
-demo/
-  service-a/      express + axios. Calls service-b.
-  service-b/      express + pg 7.4.0. Talks to payments-db (PG 15).
-  collector/      OpenTelemetry collector config.
+  types/          shared Zod schemas: node, edge, event, result types
+  core/           graph engine, tree-sitter extraction, OTel ingest, REST API, neat CLI
+  mcp/            stdio MCP server exposing the ten tools to AI agents
+  web/            Next.js dashboard
+  claude-skill/   Claude Code skill metadata
+  neat.is/        umbrella package
 ```
-
----
 
 ## Documentation
 
-- [`PROVENANCE.md`](./PROVENANCE.md) — the five edge states and how confidence travels along a path.
-- [`CLAUDE.md`](./CLAUDE.md) — guide for agents and contributors working in this repo.
-- [`docs/architecture.md`](./docs/architecture.md) — short reference to package boundaries and data flow.
-- [`docs/decisions.md`](./docs/decisions.md) — ADR log.
-- [`docs/milestones.md`](./docs/milestones.md) — sprint status; the canonical record of what's done.
-- [`docs/runbook.md`](./docs/runbook.md) — day-to-day commands and recovery recipes.
-- [`docs/railway.md`](./docs/railway.md) — deploying the demo to Railway.
-- [`packages/mcp/skill.md`](./packages/mcp/skill.md) — Claude Code skill metadata for the MCP tools.
+- [`PROVENANCE.md`](./PROVENANCE.md): the four edge states and how confidence travels along a path.
+- [`CLAUDE.md`](./CLAUDE.md): guide for agents and contributors working in this repo.
+- [`docs/architecture.md`](./docs/architecture.md): package boundaries and data flow.
+- [`docs/api-reference.md`](./docs/api-reference.md): REST endpoints and MCP tool signatures.
+- [`docs/runbook.md`](./docs/runbook.md): day-to-day commands and recovery recipes.
+- [`docs/contracts.md`](./docs/contracts.md): the binding rules every PR must hold to.
+- [`CONTRIBUTING.md`](./CONTRIBUTING.md): branch convention, PR shape, dev setup.
+- [`SECURITY.md`](./SECURITY.md): how to report vulnerabilities.
 
----
+## Contributing
+
+PRs welcome. Read [`CONTRIBUTING.md`](./CONTRIBUTING.md) first for the branch convention, PR shape, and the contracts framework that gates every change.
 
 ## License
 
-Apache 2.0.
+Apache 2.0. See [`LICENSE`](./LICENSE).
