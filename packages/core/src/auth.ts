@@ -59,17 +59,34 @@ export interface AuthOptions {
   // check. The fail-loud bind-authority gate still applies upstream. Wired
   // to `NEAT_AUTH_PROXY=true` in production.
   trustProxy?: boolean
+  // ADR-073 §3 amendment — public-read mode for reference deployments.
+  // When `true`, GET / HEAD / OPTIONS pass through without a bearer; every
+  // other verb still requires the token. OTLP ingest is excluded — that
+  // surface stays gated unconditionally (the receiver mounts its own
+  // middleware without this flag).
+  publicRead?: boolean
   // Extra paths (or path suffixes) to leave unauthenticated. Used by tests
   // and by ad-hoc callers that mount their own probes.
   extraUnauthenticatedSuffixes?: ReadonlyArray<string>
 }
 
+// Verbs the public-read split treats as reads. Everything else is a write
+// and keeps the bearer requirement.
+const PUBLIC_READ_METHODS: ReadonlySet<string> = new Set(['GET', 'HEAD', 'OPTIONS'])
+
 // Probes that always stay open. Dual-mounted under `/projects/:project/` too,
 // so the check is a suffix match — `/projects/foo/health` is skipped along
 // with the top-level `/health`. ADR-073 §3 names `/healthz` and `/readyz`
 // explicitly; `/health` is the existing endpoint the web shell and CI smoke
-// already lean on, so it keeps the unauthenticated treatment.
-const DEFAULT_UNAUTH_SUFFIXES: ReadonlyArray<string> = ['/health', '/healthz', '/readyz']
+// already lean on, so it keeps the unauthenticated treatment. `/api/config`
+// is the public-read negotiation endpoint — the web shell hits it before any
+// authed call to learn which mode the daemon is running in.
+const DEFAULT_UNAUTH_SUFFIXES: ReadonlyArray<string> = [
+  '/health',
+  '/healthz',
+  '/readyz',
+  '/api/config',
+]
 
 export function mountBearerAuth(app: FastifyInstance, opts: AuthOptions): void {
   if (!opts.token || opts.token.length === 0) return
@@ -77,6 +94,7 @@ export function mountBearerAuth(app: FastifyInstance, opts: AuthOptions): void {
 
   const expected = Buffer.from(opts.token, 'utf8')
   const suffixes = [...DEFAULT_UNAUTH_SUFFIXES, ...(opts.extraUnauthenticatedSuffixes ?? [])]
+  const publicRead = opts.publicRead === true
 
   app.addHook('preHandler', (req: FastifyRequest, reply: FastifyReply, done: (err?: Error) => void) => {
     const path = (req.url.split('?')[0] ?? '').replace(/\/+$/, '')
@@ -85,6 +103,16 @@ export function mountBearerAuth(app: FastifyInstance, opts: AuthOptions): void {
         done()
         return
       }
+    }
+
+    // Public-read split: GET / HEAD / OPTIONS pass through anonymously, every
+    // other verb keeps the bearer check. The token still authorizes writes,
+    // and the bind-authority gate above still demands a token for non-loopback
+    // binds — public-read enables anonymous reads on top of that, it doesn't
+    // replace either invariant.
+    if (publicRead && PUBLIC_READ_METHODS.has(req.method)) {
+      done()
+      return
     }
 
     const header = req.headers.authorization
@@ -102,11 +130,18 @@ export function mountBearerAuth(app: FastifyInstance, opts: AuthOptions): void {
 }
 
 // Read both tokens from the environment in one place so server.ts, daemon.ts,
-// and the OTel receivers all agree on precedence (ADR-073 §4).
+// and the OTel receivers all agree on precedence (ADR-073 §4). `publicRead`
+// rides the same shape so callers don't need a second env read.
 export interface AuthEnv {
   authToken: string | undefined
   otelToken: string | undefined
   trustProxy: boolean
+  publicRead: boolean
+}
+
+function parseBoolEnv(v: string | undefined): boolean {
+  if (!v) return false
+  return v === 'true' || v === '1'
 }
 
 export function readAuthEnv(env: NodeJS.ProcessEnv = process.env): AuthEnv {
@@ -116,5 +151,6 @@ export function readAuthEnv(env: NodeJS.ProcessEnv = process.env): AuthEnv {
     authToken: t && t.length > 0 ? t : undefined,
     otelToken: ot && ot.length > 0 ? ot : t && t.length > 0 ? t : undefined,
     trustProxy: env.NEAT_AUTH_PROXY === 'true',
+    publicRead: parseBoolEnv(env.NEAT_PUBLIC_READ),
   }
 }
