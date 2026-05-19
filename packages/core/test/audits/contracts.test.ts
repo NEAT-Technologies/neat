@@ -9237,17 +9237,338 @@ describe('ADR-074 — neat sync + env-dimension + framework installers', () => {
 
   // ── §1. `neat sync` verb ──────────────────────────────────────────────
   describe('§1 neat sync verb', () => {
-    it.todo('ADR-074 §1 — `neat sync` is registered as a top-level verb in cli.ts')
-    it.todo('ADR-074 §1 — neat sync re-runs discovery + extraction + SDK apply + daemon notify in order')
-    it.todo('ADR-074 §1 — neat sync skips registry registration, browser open, and the first-run summary')
-    it.todo('ADR-074 §1 — neat sync against an unregistered path exits 1 with a message pointing at `neat <path>` / `neat init`')
-    it.todo('ADR-074 §1 — daemon-running branch writes the snapshot and signals the daemon to reload')
-    it.todo('ADR-074 §1 — daemon-down branch writes the snapshot, prints the soft warning, exits 2; does not spawn the daemon')
-    it.todo('ADR-074 §1 — --project <name> selects a registered project when run outside the project directory')
-    it.todo('ADR-074 §1 — --dry-run runs discovery + extract in-memory and writes nothing')
-    it.todo('ADR-074 §1 — --no-instrument skips the SDK apply step (matching `neat <path>`)')
-    it.todo('ADR-074 §1 — --json emits the delta summary as a structured payload on stdout')
-    it.todo('ADR-074 §1 — exit codes mirror the orchestrator (0 clean / 1 fatal / 2 soft-warning)')
+    const cliSrc = (): string => readFileSync(join(CORE_SRC, 'cli.ts'), 'utf8')
+    const syncSrc = (): string => readFileSync(join(CORE_SRC, 'cli-verbs.ts'), 'utf8')
+
+    // Each runSync invocation needs an isolated NEAT_HOME so writes to the
+    // registry don't trample the operator's real machine state. Helper
+    // returns the registry path so the caller can seed it before invoking.
+    async function scaffoldSyncEnv(opts: {
+      project?: string
+      registerProject?: boolean
+    } = {}): Promise<{
+      neatHome: string
+      projectDir: string
+      previousNeatHome: string | undefined
+      restore: () => void
+    }> {
+      const { mkdtempSync, mkdirSync } = await import('node:fs')
+      const { tmpdir } = await import('node:os')
+      const home = mkdtempSync(join(tmpdir(), 'neat-sync-home-'))
+      const projectDir = mkdtempSync(join(tmpdir(), 'neat-sync-project-'))
+      // Minimal scaffold: a single JS service so discovery doesn't return
+      // empty (and so apply has something to consider).
+      mkdirSync(join(projectDir, 'svc'), { recursive: true })
+      const fsSync = await import('node:fs')
+      fsSync.writeFileSync(
+        join(projectDir, 'svc', 'package.json'),
+        JSON.stringify({ name: 'svc', main: 'index.js' }),
+        'utf8',
+      )
+      fsSync.writeFileSync(join(projectDir, 'svc', 'index.js'), '// noop\n', 'utf8')
+
+      const previous = process.env.NEAT_HOME
+      process.env.NEAT_HOME = home
+
+      if (opts.registerProject) {
+        const { addProject } = await import('../../src/registry.js')
+        await addProject({
+          name: opts.project ?? 'sync-fixture',
+          path: projectDir,
+          languages: ['javascript'],
+          status: 'active',
+        })
+      }
+      return {
+        neatHome: home,
+        projectDir,
+        previousNeatHome: previous,
+        restore: () => {
+          if (previous === undefined) delete process.env.NEAT_HOME
+          else process.env.NEAT_HOME = previous
+        },
+      }
+    }
+
+    it('ADR-074 §1 — `neat sync` is registered as a top-level verb in cli.ts', () => {
+      const src = cliSrc()
+      expect(src).toMatch(/if \(cmd === ['"]sync['"]\)/)
+      expect(src).toMatch(/import \{ runSync \} from ['"]\.\/cli-verbs\.js['"]/)
+    })
+
+    it('ADR-074 §1 — neat sync re-runs discovery + extraction + SDK apply + daemon notify in order', () => {
+      const src = syncSrc()
+      // Step order is established by source position. extractAndPersist comes
+      // before applyInstallersOver, which precedes pushSnapshotToRemote.
+      const idxExtract = src.indexOf('extractAndPersist(')
+      const idxApply = src.indexOf('applyInstallersOver(')
+      const idxPush = src.indexOf('pushSnapshotToRemote(')
+      expect(idxExtract).toBeGreaterThan(0)
+      expect(idxApply).toBeGreaterThan(idxExtract)
+      expect(idxPush).toBeGreaterThan(idxApply)
+    })
+
+    it('ADR-074 §1 — neat sync skips registry registration, browser open, and the first-run summary', () => {
+      const src = syncSrc()
+      // None of the first-run-only primitives are referenced from runSync.
+      expect(src).not.toMatch(/addProject\(/)
+      expect(src).not.toMatch(/openBrowser\(/)
+      expect(src).not.toMatch(/spawnDaemonDetached\(/)
+      expect(src).not.toMatch(/renderValueForwardSummary\(/)
+    })
+
+    it('ADR-074 §1 — neat sync against an unregistered path exits 1 with a message pointing at `neat <path>` / `neat init`', async () => {
+      const env = await scaffoldSyncEnv({ registerProject: false })
+      try {
+        const { runSync } = await import('../../src/cli-verbs.js')
+        const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+        const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+        const result = await runSync({
+          project: 'no-such-project',
+          dryRun: false,
+          noInstrument: true,
+          json: false,
+          cwd: env.projectDir,
+        })
+        const errMessages = errSpy.mock.calls.map((c) => String(c[0])).join('\n')
+        errSpy.mockRestore()
+        logSpy.mockRestore()
+        expect(result.exitCode).toBe(1)
+        expect(errMessages).toMatch(/no registered project/)
+        expect(errMessages).toMatch(/neat <path>|neat init/)
+      } finally {
+        env.restore()
+      }
+    })
+
+    it('ADR-074 §1 — daemon-running branch writes the snapshot and signals the daemon to reload', async () => {
+      // The runtime branch we assert here is "daemon-up healthcheck → POST
+      // snapshot to /snapshot." Source-level verification keeps the test
+      // fast and free of a real daemon. The integration smoke that exercises
+      // the network round-trip lives outside the audit file.
+      const src = syncSrc()
+      expect(src).toMatch(/checkDaemonHealth\(/)
+      expect(src).toMatch(/pushSnapshotToRemote\(/)
+      // The POST helper hits /projects/:project/snapshot — that's the
+      // dual-mount path mergeSnapshot routes through.
+      const clientSrc = readFileSync(join(CORE_SRC, 'cli-client.ts'), 'utf8')
+      expect(clientSrc).toMatch(/\/projects\/\$\{[^}]+\}\/snapshot/)
+      // And the snapshot lands on disk first (saveGraphToDisk before the
+      // notify call) so the daemon-up branch leaves a recoverable artifact.
+      const idxSave = src.indexOf('saveGraphToDisk(')
+      const idxPush = src.indexOf('pushSnapshotToRemote(')
+      expect(idxSave).toBeGreaterThan(0)
+      expect(idxPush).toBeGreaterThan(idxSave)
+    })
+
+    it('ADR-074 §1 — daemon-down branch writes the snapshot, prints the soft warning, exits 2; does not spawn the daemon', async () => {
+      const env = await scaffoldSyncEnv({
+        project: 'sync-daemon-down',
+        registerProject: true,
+      })
+      try {
+        const { runSync } = await import('../../src/cli-verbs.js')
+        const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+        const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+        // Pick a port the test box guarantees nothing is listening on.
+        const result = await runSync({
+          project: 'sync-daemon-down',
+          dryRun: false,
+          noInstrument: true,
+          json: false,
+          cwd: env.projectDir,
+          daemonUrl: 'http://127.0.0.1:1',
+        })
+        const errMessages = errSpy.mock.calls.map((c) => String(c[0])).join('\n')
+        errSpy.mockRestore()
+        logSpy.mockRestore()
+        expect(result.exitCode).toBe(2)
+        expect(result.daemon).toBe('down')
+        expect(result.snapshotPath).not.toBeNull()
+        expect(existsSync(result.snapshotPath as string)).toBe(true)
+        expect(errMessages).toMatch(/daemon not running/)
+        expect(errMessages).toMatch(/neatd start/)
+        // No daemon spawn — confirmed structurally because runSync never
+        // imports the orchestrator's spawn helper.
+        expect(syncSrc()).not.toMatch(/spawnDaemonDetached\(/)
+      } finally {
+        env.restore()
+      }
+    })
+
+    it('ADR-074 §1 — --project <name> selects a registered project when run outside the project directory', async () => {
+      const env = await scaffoldSyncEnv({
+        project: 'sync-named',
+        registerProject: true,
+      })
+      try {
+        const { runSync } = await import('../../src/cli-verbs.js')
+        const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+        const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+        const { tmpdir } = await import('node:os')
+        // CWD is outside the project directory — only the --project flag
+        // can match against the registry.
+        const result = await runSync({
+          project: 'sync-named',
+          dryRun: true,
+          noInstrument: true,
+          json: false,
+          cwd: tmpdir(),
+        })
+        errSpy.mockRestore()
+        logSpy.mockRestore()
+        expect(result.project).toBe('sync-named')
+        // realpath() may resolve to /private/var on macOS — compare via
+        // realpath on both sides to keep the assertion portable.
+        const fsSync = await import('node:fs')
+        const realProjectDir = fsSync.realpathSync(env.projectDir)
+        expect(result.scanPath).toBe(realProjectDir)
+      } finally {
+        env.restore()
+      }
+    })
+
+    it('ADR-074 §1 — --dry-run runs discovery + extract in-memory and writes nothing', async () => {
+      const env = await scaffoldSyncEnv({
+        project: 'sync-dry',
+        registerProject: true,
+      })
+      try {
+        const { runSync } = await import('../../src/cli-verbs.js')
+        const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+        const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+        const result = await runSync({
+          project: 'sync-dry',
+          dryRun: true,
+          noInstrument: true,
+          json: false,
+          cwd: env.projectDir,
+        })
+        errSpy.mockRestore()
+        logSpy.mockRestore()
+        expect(result.exitCode).toBe(0)
+        expect(result.mode).toBe('dry-run')
+        expect(result.snapshotPath).toBeNull()
+        // neat-out/graph.json must not exist (we wrote nothing).
+        expect(existsSync(join(env.projectDir, 'neat-out', 'graph.json'))).toBe(false)
+      } finally {
+        env.restore()
+      }
+    })
+
+    it('ADR-074 §1 — --no-instrument skips the SDK apply step (matching `neat <path>`)', async () => {
+      const env = await scaffoldSyncEnv({
+        project: 'sync-no-instrument',
+        registerProject: true,
+      })
+      try {
+        const { runSync } = await import('../../src/cli-verbs.js')
+        const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+        const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+        const result = await runSync({
+          project: 'sync-no-instrument',
+          dryRun: true,
+          noInstrument: true,
+          json: false,
+          cwd: env.projectDir,
+        })
+        errSpy.mockRestore()
+        logSpy.mockRestore()
+        expect(result.apply.skipped).toBe(true)
+        expect(result.apply.instrumented).toBe(0)
+      } finally {
+        env.restore()
+      }
+    })
+
+    it('ADR-074 §1 — --json emits the delta summary as a structured payload on stdout', async () => {
+      const env = await scaffoldSyncEnv({
+        project: 'sync-json',
+        registerProject: true,
+      })
+      const writes: string[] = []
+      const writeSpy = vi
+        .spyOn(process.stdout, 'write')
+        .mockImplementation((chunk: string | Uint8Array) => {
+          writes.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString())
+          return true
+        })
+      const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+      const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+      try {
+        const { runSync } = await import('../../src/cli-verbs.js')
+        await runSync({
+          project: 'sync-json',
+          dryRun: true,
+          noInstrument: true,
+          json: true,
+          cwd: env.projectDir,
+        })
+        const stdout = writes.join('')
+        const parsed = JSON.parse(stdout.trim())
+        expect(parsed).toMatchObject({
+          project: 'sync-json',
+          mode: 'dry-run',
+          apply: expect.objectContaining({ skipped: true }),
+        })
+        expect(typeof parsed.nodesAdded).toBe('number')
+        expect(typeof parsed.edgesAdded).toBe('number')
+      } finally {
+        writeSpy.mockRestore()
+        errSpy.mockRestore()
+        logSpy.mockRestore()
+        env.restore()
+      }
+    })
+
+    it('ADR-074 §1 — exit codes mirror the orchestrator (0 clean / 1 fatal / 2 soft-warning)', async () => {
+      // The full code surface — 0 (dry-run clean), 1 (unregistered),
+      // 2 (daemon-down) — is exercised by the three branches above. This
+      // assertion is the rollup that pins them as a triple so changes that
+      // collapse the distinction are caught at audit time.
+      const env = await scaffoldSyncEnv({
+        project: 'sync-exit-codes',
+        registerProject: true,
+      })
+      try {
+        const { runSync } = await import('../../src/cli-verbs.js')
+        const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+        const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+
+        const clean = await runSync({
+          project: 'sync-exit-codes',
+          dryRun: true,
+          noInstrument: true,
+          json: false,
+          cwd: env.projectDir,
+        })
+        expect(clean.exitCode).toBe(0)
+
+        const fatal = await runSync({
+          project: 'definitely-not-registered',
+          dryRun: false,
+          noInstrument: true,
+          json: false,
+          cwd: env.projectDir,
+        })
+        expect(fatal.exitCode).toBe(1)
+
+        const soft = await runSync({
+          project: 'sync-exit-codes',
+          dryRun: false,
+          noInstrument: true,
+          json: false,
+          cwd: env.projectDir,
+          daemonUrl: 'http://127.0.0.1:1',
+        })
+        expect(soft.exitCode).toBe(2)
+
+        errSpy.mockRestore()
+        logSpy.mockRestore()
+      } finally {
+        env.restore()
+      }
+    })
   })
 
   // ── §2. Env-dimension at ingest ───────────────────────────────────────

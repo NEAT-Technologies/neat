@@ -34,6 +34,7 @@ import {
   type PatchSection,
 } from './installers/index.js'
 import { runOrchestrator } from './orchestrator.js'
+import { runSync } from './cli-verbs.js'
 import { DivergenceTypeSchema, type DivergenceType } from '@neat.is/types'
 import {
   createHttpClient,
@@ -110,6 +111,15 @@ function usage(): void {
   console.log('  deploy         Detect the deploy substrate, generate NEAT_AUTH_TOKEN,')
   console.log('                 emit a docker-compose / systemd / docker run artifact, and')
   console.log('                 print the OTel env-vars block to paste into your platform.')
+  console.log('  sync           Re-run discovery, extraction, and SDK apply against the')
+  console.log('                 registered project, then notify the running daemon.')
+  console.log('                 Flags:')
+  console.log('                   --project <name>   target a registered project by name')
+  console.log('                   --to <url>         push the snapshot to a remote daemon')
+  console.log('                   --token <token>    bearer token for --to (or $NEAT_REMOTE_TOKEN)')
+  console.log('                   --dry-run          run extraction in-memory; do not write')
+  console.log('                   --no-instrument    skip the SDK install apply step')
+  console.log('                   --json             emit the delta summary as JSON')
   console.log('')
   console.log('query commands (mirror the MCP tools, ADR-050):')
   console.log('  root-cause <node-id>             Walk inbound edges to find what broke first.')
@@ -177,6 +187,9 @@ interface ParsedArgs {
   hypotheticalAction: string | null
   type: string | null
   minConfidence: number | null
+  // `neat sync` (ADR-074 §1) — remote daemon URL + bearer token.
+  to: string | null
+  token: string | null
   positional: string[]
 }
 
@@ -196,6 +209,8 @@ const STRING_FLAGS = [
   ['--hypothetical-action', 'hypotheticalAction'],
   ['--type', 'type'],
   ['--min-confidence', 'minConfidence'],
+  ['--to', 'to'],
+  ['--token', 'token'],
 ] as const
 
 function parseArgs(rest: string[]): ParsedArgs {
@@ -221,6 +236,8 @@ function parseArgs(rest: string[]): ParsedArgs {
     hypotheticalAction: null,
     type: null,
     minConfidence: null,
+    to: null,
+    token: null,
     positional: [],
   }
   for (let i = 0; i < rest.length; i++) {
@@ -785,6 +802,22 @@ async function main(): Promise<void> {
     console.log()
     console.log('To start NEAT, run:')
     console.log(`  ${artifact.startCommand}`)
+    return
+  }
+
+  if (cmd === 'sync') {
+    // ADR-074 §1 — re-runs discovery + extract + SDK apply + daemon notify
+    // against the registered project. Skips registry registration, browser
+    // open, daemon spawn, and the first-run summary block.
+    const result = await runSync({
+      ...(parsed.project ? { project: parsed.project } : {}),
+      ...(parsed.to ? { to: parsed.to } : {}),
+      ...(parsed.token ? { token: parsed.token } : {}),
+      dryRun: parsed.dryRun,
+      noInstrument: parsed.noInstrument,
+      json: parsed.json,
+    })
+    if (result.exitCode !== 0) process.exit(result.exitCode)
     return
   }
 
