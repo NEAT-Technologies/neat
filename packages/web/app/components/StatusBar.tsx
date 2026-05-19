@@ -10,9 +10,43 @@ import {
   type SseEvent,
 } from '../../lib/proxy-client'
 import { authedFetch } from '../../lib/authed-fetch'
+import { useDaemonAuthConfig } from '../../lib/public-read-mode'
 
 const ENV_TOOLTIP =
   "Each NEAT instance has its own graph. Local sees your dev environment; remote sees what you've deployed it to."
+
+const PUBLIC_READ_TOOLTIP =
+  'This NEAT instance is publicly readable. Sign in to make changes.'
+
+// ADR-073 §3 amendment — small chip alongside the env indicator on reference
+// deployments. Distinct steel-blue so the operator can tell at a glance that
+// the dashboard is wired for reads only.
+export function PublicReadIndicator() {
+  const { config, ready } = useDaemonAuthConfig()
+  if (!ready || !config.publicRead) return null
+
+  return (
+    <div className="st-item" data-public-read="true">
+      <span
+        className="public-read-chip"
+        data-testid="public-read-chip"
+        title={PUBLIC_READ_TOOLTIP}
+        aria-label={PUBLIC_READ_TOOLTIP}
+        style={{
+          background: 'rgba(125,165,210,0.20)',
+          color: '#9bb7d8',
+          border: '1px solid rgba(125,165,210,0.40)',
+          borderRadius: 999,
+          padding: '1px 8px',
+          fontSize: 10.5,
+          letterSpacing: 0.2,
+        }}
+      >
+        public read-only
+      </span>
+    </div>
+  )
+}
 
 function isLocalHost(host: string): boolean {
   return host === 'localhost' || host === '127.0.0.1' || host === '[::1]' || host === '::1'
@@ -256,7 +290,11 @@ export function StatusBar({ project, graphData }: StatusBarProps) {
         <span className="v">{sseState}</span>
       </div>
       <EnvironmentIndicator />
+<<<<<<< HEAD
       <SignOutButton />
+=======
+      <PublicReadIndicator />
+>>>>>>> 9d49b46 (StatusBar surfaces a public-read badge when the daemon advertises it)
       <div className="st-item">
         <span className="k">nodes</span>
         <span className="v" id="st-nodes">{nodeCount}</span>
