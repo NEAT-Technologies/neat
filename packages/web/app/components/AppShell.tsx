@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from 'react'
 import { authedFetch } from '../../lib/authed-fetch'
+import { useAuthGate } from '../../lib/use-auth-gate'
 import { TopBar } from './TopBar'
 import { Rail } from './Rail'
 import { GraphCanvas } from './GraphCanvas'
@@ -36,6 +37,9 @@ function readStoredProject(): string | null {
 }
 
 export function AppShell() {
+  // ADR-073 §3 — gate the dashboard behind a bearer; reverse-proxy
+  // operators opt out via NEXT_PUBLIC_NEAT_AUTH_PROXY=true.
+  useAuthGate()
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null)
   const [graphData, setGraphData] = useState<GraphData | null>(null)
   // ADR-057 #2 — start with URL or localStorage (synchronous), then resolve

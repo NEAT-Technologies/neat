@@ -3,6 +3,7 @@
 import { useEffect, useState } from 'react'
 import Link from 'next/link'
 import { authedFetch } from '../../lib/authed-fetch'
+import { useAuthGate } from '../../lib/use-auth-gate'
 
 interface Incident {
   nodeId: string
@@ -28,6 +29,8 @@ function formatTs(iso: string): string {
 }
 
 export function IncidentsClient() {
+  // ADR-073 §3 — same bearer gate AppShell uses.
+  useAuthGate()
   const [data, setData] = useState<IncidentsResponse | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
