@@ -320,7 +320,7 @@ function printBanner(): void {
   console.log('╚═╝  ╚═══╝╚══════╝╚═╝  ╚═╝   ╚═╝   ')
   console.log('')
   console.log('  Network Expressive Architecting Tool')
-  console.log('  neat.is  ·  v0.2.5  ·  BSL 1.1')
+  console.log('  neat.is  ·  v0.4.0  ·  Apache 2.0')
   console.log('')
 }
 
