@@ -8461,9 +8461,156 @@ describe('ADR-073 — one-command CLI + deployment-target + delegated auth', () 
   it.todo('ADR-073 §4 — OTLP/gRPC opt-in receiver on :4317 honors the same precedence')
 
   // ── §5. `.env.neat` localhost default + OTel env precedence ───────────
-  it.todo('ADR-073 §5 — SDK installer continues to write OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 to .env.neat')
+  it('ADR-073 §5 — SDK installer continues to write OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 to .env.neat', async () => {
+    const { renderEnvNeat } = await import('../../src/installers/templates.js')
+    const env = renderEnvNeat('demo-svc')
+    expect(env).toMatch(/OTEL_EXPORTER_OTLP_ENDPOINT=http:\/\/localhost:4318/)
+    expect(env).toMatch(/OTEL_SERVICE_NAME=demo-svc/)
+  })
   it.todo('ADR-073 §5 — orchestrator summary includes the OTel override block (matches `neat deploy` format)')
-  it.todo('ADR-073 §5 — NEAT does not write a second `.env.neat` for prod')
+  it('ADR-073 §5 — NEAT does not write a second `.env.neat` for prod', () => {
+    // Single source of truth: the renderEnvNeat helper. No prod-flavored
+    // template exists alongside it.
+    const templates = readFileSync(join(__dirname, '../../src/installers/templates.ts'), 'utf8')
+    const matches = templates.match(/export\s+function\s+renderEnvNeat/g) ?? []
+    expect(matches.length).toBe(1)
+    // And the .env.neat key block stays at localhost — no `OTEL_EXPORTER_OTLP_ENDPOINT=https://`
+    // shows up in the generated content.
+    expect(templates).not.toMatch(/OTEL_EXPORTER_OTLP_ENDPOINT=https:/)
+  })
+
+  // ── §1. Framework-aware injection — Next.js (issue #303) ──────────────
+  it('ADR-073 §1 — javascriptInstaller detects Next.js via dep + next.config and emits framework=next', async () => {
+    const { javascriptInstaller } = await import('../../src/installers/javascript.js')
+    const fixture = join(__dirname, '../fixtures/next-baseline')
+    const result = await javascriptInstaller.plan(fixture)
+    expect(result.framework).toBe('next')
+    // No pkg.main injection on the Next path.
+    expect(result.entrypointEdits).toEqual([])
+  })
+
+  it('ADR-073 §1 — Next plan emits instrumentation.{ts,js} + instrumentation.node.{ts,js} + .env.neat at the project root', async () => {
+    const { javascriptInstaller } = await import('../../src/installers/javascript.js')
+    const fixture = join(__dirname, '../fixtures/next-baseline')
+    const result = await javascriptInstaller.plan(fixture)
+    const generated = (result.generatedFiles ?? []).map((g) => g.file.split('/').pop())
+    // tsconfig present → TS variant chosen.
+    expect(generated).toContain('instrumentation.ts')
+    expect(generated).toContain('instrumentation.node.ts')
+    expect(generated).toContain('.env.neat')
+  })
+
+  it('ADR-073 §1 — instrumentation.ts exports an async register() gated on NEXT_RUNTIME=nodejs', async () => {
+    const { NEXT_INSTRUMENTATION_TS } = await import('../../src/installers/templates.js')
+    expect(NEXT_INSTRUMENTATION_TS).toMatch(/export\s+async\s+function\s+register\s*\(\s*\)/)
+    expect(NEXT_INSTRUMENTATION_TS).toMatch(/process\.env\.NEXT_RUNTIME\s*===\s*['"]nodejs['"]/)
+    expect(NEXT_INSTRUMENTATION_TS).toMatch(/await\s+import\(['"]\.\/instrumentation\.node['"]\)/)
+  })
+
+  it('ADR-073 §1 — instrumentation.node.{ts,js} loads .env.neat then starts NodeSDK with auto-instrumentations', async () => {
+    const { NEXT_INSTRUMENTATION_NODE_TS, NEXT_INSTRUMENTATION_NODE_JS } = await import(
+      '../../src/installers/templates.js'
+    )
+    for (const tpl of [NEXT_INSTRUMENTATION_NODE_TS, NEXT_INSTRUMENTATION_NODE_JS]) {
+      expect(tpl).toMatch(/dotenv\.config\(\{\s*path:\s*path\.join\(here,\s*['"]\.env\.neat['"]\)\s*\}\)/)
+      expect(tpl).toMatch(/new\s+NodeSDK\s*\(/)
+      expect(tpl).toMatch(/getNodeAutoInstrumentations\s*\(\s*\)/)
+    }
+  })
+
+  it('ADR-073 §1 — Next plan adds the same four OTel deps as the plain Node path', async () => {
+    const { javascriptInstaller } = await import('../../src/installers/javascript.js')
+    const fixture = join(__dirname, '../fixtures/next-baseline')
+    const result = await javascriptInstaller.plan(fixture)
+    const names = result.dependencyEdits.map((d) => d.name).sort()
+    expect(names).toEqual([
+      '@opentelemetry/api',
+      '@opentelemetry/auto-instrumentations-node',
+      '@opentelemetry/sdk-node',
+      'dotenv',
+    ])
+  })
+
+  it('ADR-073 §1 — Next 15+ leaves next.config alone (instrumentationHook is on by default)', async () => {
+    const { javascriptInstaller } = await import('../../src/installers/javascript.js')
+    const fixture = join(__dirname, '../fixtures/next-baseline')
+    const result = await javascriptInstaller.plan(fixture)
+    expect(result.nextConfigEdit).toBeUndefined()
+  })
+
+  it('ADR-073 §1 — Next < 15 queues an `experimental.instrumentationHook: true` config edit', async () => {
+    const fs2 = await import('node:fs/promises')
+    const os2 = await import('node:os')
+    const root = await fs2.mkdtemp(join(os2.tmpdir(), 'next14-fixture-'))
+    await fs2.writeFile(
+      join(root, 'package.json'),
+      JSON.stringify({ name: 'app', dependencies: { next: '^14.2.3' } }, null, 2),
+    )
+    await fs2.writeFile(
+      join(root, 'next.config.js'),
+      "module.exports = { reactStrictMode: true }\n",
+    )
+    const { javascriptInstaller } = await import('../../src/installers/javascript.js')
+    const plan = await javascriptInstaller.plan(root)
+    expect(plan.framework).toBe('next')
+    expect(plan.nextConfigEdit).toBeDefined()
+    expect(plan.nextConfigEdit?.file.endsWith('next.config.js')).toBe(true)
+  })
+
+  it('ADR-073 §1 — injectInstrumentationHook is idempotent (no-op when flag already present)', async () => {
+    const { injectInstrumentationHook } = await import('../../src/installers/javascript.js')
+    const before = "module.exports = { experimental: { instrumentationHook: true } }\n"
+    expect(injectInstrumentationHook(before)).toBe(before)
+  })
+
+  it('ADR-073 §1 — Next path skips package.json#main injection', async () => {
+    const { javascriptInstaller } = await import('../../src/installers/javascript.js')
+    const fixture = join(__dirname, '../fixtures/next-baseline')
+    const before = JSON.parse(readFileSync(join(fixture, 'package.json'), 'utf8'))
+    expect(before.main).toBeUndefined()
+    const plan = await javascriptInstaller.plan(fixture)
+    expect(plan.entrypointEdits).toEqual([])
+  })
+
+  it('ADR-073 §1 — Next apply writes the instrumentation pair + .env.neat, mutates next.config on Next 14, and is idempotent', async () => {
+    const fs2 = await import('node:fs/promises')
+    const os2 = await import('node:os')
+    const root = await fs2.mkdtemp(join(os2.tmpdir(), 'next14-apply-'))
+    await fs2.writeFile(
+      join(root, 'package.json'),
+      JSON.stringify({ name: 'demo-next', dependencies: { next: '^14.2.3' } }, null, 2),
+    )
+    await fs2.writeFile(
+      join(root, 'next.config.js'),
+      "/** @type {import('next').NextConfig} */\nmodule.exports = { reactStrictMode: true }\n",
+    )
+    const { javascriptInstaller } = await import('../../src/installers/javascript.js')
+
+    const plan1 = await javascriptInstaller.plan(root)
+    const outcome1 = await javascriptInstaller.apply(plan1)
+    expect(outcome1.outcome).toBe('instrumented')
+
+    // Generated files landed at the package root (JS variant — no tsconfig).
+    expect(existsSync(join(root, 'instrumentation.js'))).toBe(true)
+    expect(existsSync(join(root, 'instrumentation.node.js'))).toBe(true)
+    expect(existsSync(join(root, '.env.neat'))).toBe(true)
+
+    // next.config grew the flag.
+    const after = readFileSync(join(root, 'next.config.js'), 'utf8')
+    expect(after).toMatch(/instrumentationHook:\s*true/)
+
+    // Deps got added to package.json.
+    const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'))
+    expect(pkg.dependencies['@opentelemetry/sdk-node']).toBeDefined()
+
+    // pkg.main stays untouched on the Next path.
+    expect(pkg.main).toBeUndefined()
+
+    // Second run — fully idempotent.
+    const plan2 = await javascriptInstaller.plan(root)
+    const outcome2 = await javascriptInstaller.apply(plan2)
+    expect(outcome2.outcome).toBe('already-instrumented')
+  })
 
   // ── §6. `neat-out/` appended to `.gitignore` automatically ────────────
   it.todo('ADR-073 §6 — init flow appends `neat-out/` to <projectDir>/.gitignore when missing')
