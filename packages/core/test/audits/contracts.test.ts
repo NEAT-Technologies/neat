@@ -8391,3 +8391,83 @@ describe('ADR-068 — FrontierNode + OBSERVED orthogonality (#267)', () => {
     expect(frontierFm).toMatch(/adr:.*ADR-068/)
   })
 })
+
+// ──────────────────────────────────────────────────────────────────────────
+// ADR-073 — one-command CLI + deployment-target + delegated auth (v0.3.8)
+//
+// Six families of assertions, one per ADR-073 numbered section. Most ride
+// in as `it.todo` at contract-landing time and flip live when the A1 / A2 /
+// A3 implementation PRs land. The non-todo rows below assert structural
+// properties that hold the moment the ADR + contract land:
+//   - the ADR-073 file lives in docs/decisions.md
+//   - the per-topic contract file exists with the right governs: globs
+//   - the contracts/contracts.md index references the new contract row
+// ──────────────────────────────────────────────────────────────────────────
+describe('ADR-073 — one-command CLI + deployment-target + delegated auth', () => {
+  // Structural assertions — live at contract-landing time.
+  it('docs/decisions.md contains an ADR-073 entry', () => {
+    const decisions = readFileSync(join(__dirname, '../../../../docs/decisions.md'), 'utf8')
+    expect(decisions).toMatch(/^## ADR-073 —/m)
+  })
+
+  it('docs/contracts/one-command-cli.md exists and governs cli.ts + server.ts + daemon.ts + otel receivers', () => {
+    const contractPath = join(__dirname, '../../../../docs/contracts/one-command-cli.md')
+    expect(existsSync(contractPath)).toBe(true)
+    const fm = readFileSync(contractPath, 'utf8')
+    expect(fm).toMatch(/governs:/)
+    expect(fm).toMatch(/packages\/core\/src\/cli\.ts/)
+    expect(fm).toMatch(/packages\/core\/src\/server\.ts/)
+    expect(fm).toMatch(/packages\/core\/src\/daemon\.ts/)
+    expect(fm).toMatch(/packages\/core\/src\/otel\.ts/)
+    expect(fm).toMatch(/adr:.*ADR-073/)
+  })
+
+  it('docs/contracts.md index has a row pointing at contracts/one-command-cli.md', () => {
+    const index = readFileSync(join(__dirname, '../../../../docs/contracts.md'), 'utf8')
+    expect(index).toMatch(/contracts\/one-command-cli\.md/)
+    expect(index).toMatch(/ADR-073/)
+  })
+
+  // ── §1. Bare-`neat <path>` orchestrator ───────────────────────────────
+  it.todo('ADR-073 §1 — `neat <path>` (directory arg, no subcommand) dispatches to the orchestrator')
+  it.todo('ADR-073 §1 — orchestrator runs discovery + extract + register + apply + daemon + open + summary in order')
+  it.todo('ADR-073 §1 — instrument default-on; `--no-instrument` skips the SDK apply step')
+  it.todo('ADR-073 §1 — open default-on; `--no-open` skips the browser launch step')
+  it.todo('ADR-073 §1 — `npx neat.is <path>` forwards through @neat.is/cli into the same orchestrator dispatch')
+  it.todo('ADR-073 §1 — `neat init` retains patch-by-default (no manifest mutation without --apply)')
+
+  // ── §2. `neat deploy` substrate detection + token generation ──────────
+  it.todo('ADR-073 §2 — `neat deploy` is a registered top-level verb in cli.ts')
+  it.todo('ADR-073 §2 — Docker-present branch emits a docker-compose.yml snippet declaring NEAT_AUTH_TOKEN')
+  it.todo('ADR-073 §2 — systemd branch emits a neatd.service unit with EnvironmentFile=/etc/neat/neatd.env')
+  it.todo('ADR-073 §2 — fallback branch emits a `docker run` snippet naming the bearer env-var')
+  it.todo('ADR-073 §2 — every branch auto-generates a 32-byte base64url NEAT_AUTH_TOKEN, printed once')
+  it.todo('ADR-073 §2 — generated artifacts reference NEAT_AUTH_TOKEN by name but never embed the token value')
+  it.todo('ADR-073 §2 — `neat deploy` prints the OTel env-vars block with the matching token')
+
+  // ── §3. Delegated auth via NEAT_AUTH_TOKEN ────────────────────────────
+  it.todo('ADR-073 §3 — NEAT_AUTH_TOKEN set: middleware mounts on /api/* and /events; missing header → 401')
+  it.todo('ADR-073 §3 — NEAT_AUTH_TOKEN set: wrong token → 401 with constant-time comparison')
+  it.todo('ADR-073 §3 — NEAT_AUTH_TOKEN set: /healthz and /readyz stay unauthenticated')
+  it.todo('ADR-073 §3 — NEAT_AUTH_TOKEN unset + non-loopback bind: `neatd start` exits non-zero with the documented error string')
+  it.todo('ADR-073 §3 — NEAT_AUTH_TOKEN unset + loopback bind: daemon starts unauthenticated (laptop dev path)')
+  it.todo('ADR-073 §3 — auth middleware mounts before any project router (no per-project bypass)')
+  it.todo('ADR-073 §3 — web UI reads the token from /api/config and carries it on subsequent requests')
+
+  // ── §4. OTLP bearer + NEAT_OTEL_TOKEN rotation ────────────────────────
+  it.todo('ADR-073 §4 — OTLP receiver at :4318 validates `Authorization: Bearer <NEAT_AUTH_TOKEN>` by default')
+  it.todo('ADR-073 §4 — NEAT_OTEL_TOKEN when set overrides for the OTLP receiver only (REST keeps NEAT_AUTH_TOKEN)')
+  it.todo('ADR-073 §4 — neither token set → OTLP ingest unauthenticated and loopback-only per §3')
+  it.todo('ADR-073 §4 — OTLP/gRPC opt-in receiver on :4317 honors the same precedence')
+
+  // ── §5. `.env.neat` localhost default + OTel env precedence ───────────
+  it.todo('ADR-073 §5 — SDK installer continues to write OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 to .env.neat')
+  it.todo('ADR-073 §5 — orchestrator summary includes the OTel override block (matches `neat deploy` format)')
+  it.todo('ADR-073 §5 — NEAT does not write a second `.env.neat` for prod')
+
+  // ── §6. `neat-out/` appended to `.gitignore` automatically ────────────
+  it.todo('ADR-073 §6 — init flow appends `neat-out/` to <projectDir>/.gitignore when missing')
+  it.todo('ADR-073 §6 — `.gitignore` is created with the single `neat-out/` line when absent')
+  it.todo('ADR-073 §6 — re-running init does not duplicate the `neat-out/` line (idempotent on exact match)')
+  it.todo('ADR-073 §6 — `neat init --dry-run` lists the planned `.gitignore` write in the summary')
+})
