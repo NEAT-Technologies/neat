@@ -44,6 +44,11 @@ import {
   writeAtomically,
 } from './registry.js'
 import { assertBindAuthority, readAuthEnv } from './auth.js'
+import {
+  appendUnroutedSpan,
+  buildUnroutedSpanRecord,
+  unroutedErrorsPath,
+} from './unrouted.js'
 import type { RegistryEntry } from '@neat.is/types'
 
 export interface DaemonOptions {
@@ -290,6 +295,33 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<DaemonHandl
     )
   }
 
+  // v0.4.1 / refs #339 — when a span's `service.name` doesn't match any
+  // registered project AND no `default` project is registered, the span has
+  // nowhere to land. We still return 200 on the receiver (OTel spec) but the
+  // event lands in <NEAT_HOME>/errors.ndjson so the next operator can see
+  // what happened instead of the daemon's stderr being the only signal.
+  // Same rate limit as the broken-project warning, keyed by service.name.
+  const unroutedPath = unroutedErrorsPath(home)
+  const lastUnroutedWarnAt = new Map<string, number>()
+  async function recordUnroutedSpan(
+    serviceName: string | undefined,
+    traceId: string | undefined,
+  ): Promise<void> {
+    const key = serviceName ?? '<missing>'
+    const now = Date.now()
+    try {
+      await appendUnroutedSpan(home, buildUnroutedSpanRecord(serviceName, traceId, new Date(now)))
+    } catch {
+      // best-effort — failing to log shouldn't cascade into receiver failure.
+    }
+    const prev = lastUnroutedWarnAt.get(key) ?? 0
+    if (now - prev < DROP_WARN_INTERVAL_MS) return
+    lastUnroutedWarnAt.set(key, now)
+    console.warn(
+      `[neatd] dropping span — service.name "${key}" matches no registered project and no \`default\` project exists. See ${unroutedPath}.`,
+    )
+  }
+
   function upsertRegistryFromSlot(slot: ProjectSlot): void {
     if (slot.status !== 'active') return
     registry.set(slot.entry.name, {
@@ -420,14 +452,20 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<DaemonHandl
     // Resolve a span's target slot — running the broken-state recovery
     // when the routed slot is currently broken. Returns null when the span
     // can't be delivered after the recovery attempt; the caller drops with
-    // a rate-limited warning.
+    // a rate-limited warning. v0.4.1 / refs #339 — when nothing matches and
+    // no default slot exists, the no-project-match event lands in
+    // <NEAT_HOME>/errors.ndjson before we return null.
     async function resolveTargetSlot(
       serviceName: string | undefined,
+      traceId: string | undefined,
     ): Promise<ProjectSlot | null> {
       const liveEntries = await listProjects().catch(() => [])
       const target = routeSpanToProject(serviceName, liveEntries)
       let slot = slots.get(target) ?? slots.get(DEFAULT_PROJECT)
-      if (!slot) return null
+      if (!slot) {
+        await recordUnroutedSpan(serviceName, traceId)
+        return null
+      }
       if (slot.status === 'broken') {
         const entry = liveEntries.find((e) => e.name === slot!.entry.name)
         if (entry) {
@@ -450,8 +488,10 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<DaemonHandl
           // get a single inline recovery attempt before the span is dropped
           // with a rate-limited log line. Unknown services route to
           // DEFAULT_PROJECT so the FrontierNode auto-creation flow keeps
-          // working (ADR-033).
-          const slot = await resolveTargetSlot(span.service)
+          // working (ADR-033); when DEFAULT_PROJECT isn't registered either,
+          // resolveTargetSlot writes a no-project-match event to
+          // <NEAT_HOME>/errors.ndjson (refs #339).
+          const slot = await resolveTargetSlot(span.service, span.traceId)
           if (!slot) return
           await handleSpan(
             {
@@ -465,7 +505,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<DaemonHandl
           )
         },
         onErrorSpanSync: async (span) => {
-          const slot = await resolveTargetSlot(span.service)
+          const slot = await resolveTargetSlot(span.service, span.traceId)
           if (!slot) return
           await makeErrorSpanWriter(slot.paths.errorsPath)(span)
         },

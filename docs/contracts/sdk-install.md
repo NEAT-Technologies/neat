@@ -57,9 +57,11 @@ Packages with no resolvable entry across all seven steps are **lib-only** and sk
 
 The relative path is computed against the entry's directory so the injection works regardless of the entry's depth inside the package.
 
-## Per-service `OTEL_SERVICE_NAME` (ADR-069 §4)
+## Per-project `OTEL_SERVICE_NAME` (ADR-069 §4, amended v0.4.1 — refs #339)
 
-`.env.neat` lives at the package root and carries `OTEL_SERVICE_NAME=<pkg.name>`. Scoped names (`@medusajs/auth`) are preserved verbatim — the scope matches the EXTRACTED ServiceNode id format (ADR-028 + `extract/services.ts`), so dashboards joining OBSERVED spans against the graph use the same key on both sides. NEAT does not strip scopes.
+`.env.neat` lives at the package root and carries `OTEL_SERVICE_NAME=<project>` — the registered project name the orchestrator just wrote to `~/.neat/projects.json`. Every package the installer touches in a single `neat init <path>` (or `neat <path>`) run shares the same value because the daemon routes spans by registered project name (see [`daemon.md`](./daemon.md) §routeSpanToProject). Threading the project through `plan(serviceDir, { project })` keeps the OTLP wire identity and the registry key aligned end-to-end; any divergence drops spans silently on nested-app / monorepo shapes where the inner package name doesn't equal the outer directory.
+
+Ad-hoc / test callers may invoke `plan(serviceDir)` without threading a project — the installer falls back to the package's own `pkg.name` (scope-preserved) so the generated `.env.neat` stays well-formed and ad-hoc fixtures don't need to fabricate a registry entry. Production paths (`neat init`, the bare-`neat <path>` orchestrator, `neat sync`) always pass the project.
 
 The generated `otel-init` file loads `.env.neat` via `dotenv` so the service name is in scope before the auto-instrumentation hook runs. This is why `dotenv` joins the Node dependency list as the fourth package.
 

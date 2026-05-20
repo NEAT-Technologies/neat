@@ -352,12 +352,17 @@ function printDiscoveryReport(opts: InitOptions, services: DiscoveredService[]):
 
 async function buildPatchSections(
   services: DiscoveredService[],
+  project: string,
 ): Promise<PatchSection[]> {
   const sections: PatchSection[] = []
   for (const svc of services) {
     const installer = await pickInstaller(svc.dir)
     if (!installer) continue
-    const plan: InstallPlan = await installer.plan(svc.dir)
+    // v0.4.1 / refs #339 — pass the registered project name so the per-
+    // package `.env.neat` carries `OTEL_SERVICE_NAME=<project>`. The daemon
+    // routes spans by registered project name; matching keys end-to-end
+    // is what keeps OBSERVED edges landing.
+    const plan: InstallPlan = await installer.plan(svc.dir, { project })
     // Lib-only packages keep a section so the dry-run patch documents the
     // skip and the apply summary counts them (ADR-069 §2). Empty plans
     // (already-instrumented end-to-end) drop out.
@@ -382,7 +387,7 @@ export async function runInit(opts: InitOptions): Promise<InitResult> {
   printDiscoveryReport(opts, services)
 
   // ── Step 3: plan SDK install (pure data, no fs writes) ───────────────
-  const sections = opts.noInstall ? [] : await buildPatchSections(services)
+  const sections = opts.noInstall ? [] : await buildPatchSections(services, opts.project)
   const patch = renderPatch(sections)
   const patchPath = path.join(opts.scanPath, 'neat.patch')
 

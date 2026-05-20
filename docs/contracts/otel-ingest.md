@@ -96,9 +96,21 @@ The gRPC receiver still awaits `onSpan` synchronously per request (non-blocking 
 
 ErrorEvent shape stays as defined in `@neat.is/types`. The fields added by issue #135 (`exceptionType`, `exceptionStacktrace`) landed via the schema-growth contract.
 
+## Unrouted spans (amended v0.4.1 — refs #339)
+
+When a span's `service.name` matches no registered project AND no `default` project is registered, the daemon's routing layer appends a record to `<NEAT_HOME>/errors.ndjson` before dropping the span. The receiver still returns 200 (the OTLP spec is non-negotiable on that), but stderr is no longer the only signal: the operator can read the file to see which service.name strings the OTLP sender is emitting and which never matched.
+
+Record shape:
+
+```json
+{ "timestamp": "<iso8601>", "reason": "no-project-match", "service_name": "<string|null>", "traceId": "<string|null>" }
+```
+
+A rate-limited stderr warning rides alongside, keyed by `service_name` on the same 60s interval as the broken-project warning so OTel-exporter retries don't flood the console.
+
 ## Authority
 
-Owned by `ingest.ts` per ADR-030. Receiver shape lives in `otel.ts` / `otel-grpc.ts`; mutation logic lives in `ingest.ts`. No other module mutates the graph through the OTel ingest path.
+Owned by `ingest.ts` per ADR-030. Receiver shape lives in `otel.ts` / `otel-grpc.ts`; mutation logic lives in `ingest.ts`. No other module mutates the graph through the OTel ingest path. The unrouted-span logging lives in `daemon.ts` because the routing layer owns the "is there a slot to deliver to?" decision.
 
 ## Enforcement
 
