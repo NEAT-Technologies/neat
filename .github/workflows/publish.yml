@@ -26,7 +26,10 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      # contents: write so the final step can create the GitHub Release for
+      # this tag. The publish job is single-flight on tag push; the Release
+      # rides the same surface so the npm + ghcr + Release trio land together.
+      contents: write
       id-token: write
       packages: write
     env:
@@ -243,13 +246,28 @@ jobs:
           cid=$(docker run --rm -d -e NEAT_AUTH_TOKEN="$token" -p 18080:8080 "$image")
           echo "  container started, id=$cid"
 
-          # Wait up to 30s for the REST surface to bind.
+          # Wait up to 30s for the REST surface to bind. The image ships a
+          # default project pointed at /workspace so `neatd start` reaches
+          # 'active' immediately on a bare `docker run` — no volume mount,
+          # no NEAT_HOME, no registry seeding. /health is bearer-gated when
+          # NEAT_AUTH_TOKEN is set, so the probe carries the bearer too.
+          ready=
           for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
-            if curl -sf -o /dev/null --max-time 2 http://localhost:18080/health; then
+            if curl -sf -o /dev/null --max-time 2 \
+              -H "Authorization: Bearer $token" \
+              http://localhost:18080/health; then
+              ready=yes
+              echo "  REST :8080 reachable after ~$((i * 2))s"
               break
             fi
             sleep 2
           done
+          if [ -z "$ready" ]; then
+            echo "::error::container REST surface never bound on :8080 within 30s"
+            docker logs "$cid" || true
+            docker kill "$cid" >/dev/null 2>&1 || true
+            exit 1
+          fi
 
           unauth=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:18080/graph)
           if [ "$unauth" != "401" ]; then
@@ -269,3 +287,18 @@ jobs:
 
           echo "Container auth smoke passed — 401 without bearer, 200 with bearer."
           docker kill "$cid" >/dev/null 2>&1 || true
+
+      # #336 — the publish trio is npm + ghcr + Release. With the npm publish
+      # and container publish steps green and the smoke gate clear, this final
+      # step creates the GitHub Release for the tag with auto-generated notes
+      # from merged PRs. The maintainer edits the body afterwards with the
+      # curated forward-looking prose (comms-voice rules apply).
+      - name: Create GitHub Release
+        if: env.DRY_RUN != 'true' && startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            --latest
