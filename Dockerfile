@@ -70,6 +70,27 @@ RUN printf '#!/bin/sh\nexec node /app/packages/core/dist/cli.cjs "$@"\n' > /usr/
   && printf '#!/bin/sh\nexec node /app/packages/mcp/dist/index.cjs "$@"\n' > /usr/local/bin/neat-mcp \
   && chmod +x /usr/local/bin/neat-mcp
 
+# ADR-049 #6 — neatd refuses to boot without a registry, by design for the
+# laptop dev path ("you forgot to run `neat init`"). The container ships
+# the opposite default: a registry with a single `default` project pointed
+# at /workspace, so `docker run` brings the daemon up immediately and the
+# operator's repo at `-v $(pwd):/workspace` becomes the project on next
+# extract. /workspace is mkdir'd so the slot still bootstraps to active on
+# a bare `docker run` with no volume mount (empty extraction).
+RUN mkdir -p /workspace /root/.neat \
+  && printf '%s\n' '{' \
+    '  "version": 1,' \
+    '  "projects": [' \
+    '    {' \
+    '      "name": "default",' \
+    '      "path": "/workspace",' \
+    '      "registeredAt": "1970-01-01T00:00:00.000Z",' \
+    '      "languages": [],' \
+    '      "status": "active"' \
+    '    }' \
+    '  ]' \
+    '}' > /root/.neat/projects.json
+
 VOLUME ["/workspace", "/neat-out"]
 EXPOSE 8080 4318 6328
 
