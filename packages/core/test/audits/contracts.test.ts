@@ -3724,9 +3724,30 @@ describe('SDK install — apply-side (ADR-069)', () => {
     }
   })
 
-  // ── §4 — per-service OTEL_SERVICE_NAME in .env.neat ─────────────────────
+  // ── §4 — per-project OTEL_SERVICE_NAME in .env.neat (amended v0.4.1) ────
 
-  it('§4 — .env.neat written to <package-dir> with OTEL_SERVICE_NAME=<pkg.name>', async () => {
+  it('§4 — plan({ project }) writes OTEL_SERVICE_NAME=<project> into .env.neat', async () => {
+    const fs2 = await import('node:fs/promises')
+    const path2 = await import('node:path')
+    const { javascriptInstaller } = await import('../../src/installers/javascript.js')
+    const { dir, cleanup } = await makeNodeService()
+    try {
+      // Reproduces the #339 shape — inner package name differs from the
+      // registered project. The orchestrator threads `project` through; the
+      // generated .env.neat must carry the project name, not pkg.name.
+      await writePkg(dir, { name: 'table-code', main: 'server.js' })
+      await fs2.writeFile(path2.join(dir, 'server.js'), `console.log('hi')\n`)
+      const plan = await javascriptInstaller.plan(dir, { project: 'northsea-code' })
+      await javascriptInstaller.apply(plan)
+      const env = await fs2.readFile(path2.join(dir, '.env.neat'), 'utf8')
+      expect(env).toContain('OTEL_SERVICE_NAME=northsea-code')
+      expect(env).not.toContain('OTEL_SERVICE_NAME=table-code')
+    } finally {
+      await cleanup()
+    }
+  })
+
+  it('§4 — plan() without a project falls back to pkg.name (ad-hoc / test usage)', async () => {
     const fs2 = await import('node:fs/promises')
     const path2 = await import('node:path')
     const { javascriptInstaller } = await import('../../src/installers/javascript.js')
@@ -3743,7 +3764,7 @@ describe('SDK install — apply-side (ADR-069)', () => {
     }
   })
 
-  it('§4 — scoped names (e.g. @medusajs/auth) preserved verbatim, scope not stripped', async () => {
+  it('§4 — scoped pkg.name fallback (e.g. @medusajs/auth) preserves the scope', async () => {
     const fs2 = await import('node:fs/promises')
     const path2 = await import('node:path')
     const { javascriptInstaller } = await import('../../src/installers/javascript.js')
@@ -3759,6 +3780,7 @@ describe('SDK install — apply-side (ADR-069)', () => {
       await cleanup()
     }
   })
+
 
   it('§4 — .env.neat also carries OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318', async () => {
     const fs2 = await import('node:fs/promises')
@@ -4898,6 +4920,45 @@ describe('Daemon contract (ADR-049)', () => {
       console.warn = prevWarn
       console.log = prevLog
       await cleanup()
+    }
+  })
+
+  // ── v0.4.1 / refs #339 — unrouted-span observability ────────────────────
+  it('buildUnroutedSpanRecord emits the documented {timestamp, reason, service_name, traceId} shape', async () => {
+    const { buildUnroutedSpanRecord } = await import('../../src/unrouted.js')
+    const rec = buildUnroutedSpanRecord('table-code', 'abc123', new Date('2026-05-20T12:00:00Z'))
+    expect(rec).toEqual({
+      timestamp: '2026-05-20T12:00:00.000Z',
+      reason: 'no-project-match',
+      service_name: 'table-code',
+      traceId: 'abc123',
+    })
+  })
+
+  it('buildUnroutedSpanRecord coerces missing service.name / traceId to null', async () => {
+    const { buildUnroutedSpanRecord } = await import('../../src/unrouted.js')
+    const rec = buildUnroutedSpanRecord(undefined, undefined, new Date('2026-05-20T12:00:00Z'))
+    expect(rec.service_name).toBeNull()
+    expect(rec.traceId).toBeNull()
+    expect(rec.reason).toBe('no-project-match')
+  })
+
+  it('appendUnroutedSpan appends NDJSON to <NEAT_HOME>/errors.ndjson', async () => {
+    const os2 = await import('node:os')
+    const fs2 = await import('node:fs/promises')
+    const path2 = await import('node:path')
+    const home = await fs2.mkdtemp(path2.join(os2.tmpdir(), 'neat-unrouted-'))
+    try {
+      const { appendUnroutedSpan, buildUnroutedSpanRecord } = await import('../../src/unrouted.js')
+      await appendUnroutedSpan(home, buildUnroutedSpanRecord('svc-a', 't1', new Date()))
+      await appendUnroutedSpan(home, buildUnroutedSpanRecord('svc-b', 't2', new Date()))
+      const raw = await fs2.readFile(path2.join(home, 'errors.ndjson'), 'utf8')
+      const lines = raw.trim().split('\n').map((l) => JSON.parse(l))
+      expect(lines).toHaveLength(2)
+      expect(lines[0]).toMatchObject({ reason: 'no-project-match', service_name: 'svc-a', traceId: 't1' })
+      expect(lines[1]).toMatchObject({ reason: 'no-project-match', service_name: 'svc-b', traceId: 't2' })
+    } finally {
+      await fs2.rm(home, { recursive: true, force: true })
     }
   })
 })

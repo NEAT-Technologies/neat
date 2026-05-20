@@ -124,9 +124,12 @@ export async function extractAndPersist(
 
 // SDK-install apply over a discovered service list. Returns the same shape
 // the orchestrator's result.steps.apply uses so callers (orchestrator + sync)
-// share the rollup logic.
+// share the rollup logic. v0.4.1 / refs #339 — `project` is threaded through
+// to the installer so the per-package `.env.neat` carries
+// `OTEL_SERVICE_NAME=<project>`, matching the daemon's routing key.
 export async function applyInstallersOver(
   services: Awaited<ReturnType<typeof discoverServices>>,
+  project: string,
 ): Promise<{ instrumented: number; alreadyInstrumented: number; libOnly: number }> {
   let instrumented = 0
   let already = 0
@@ -134,7 +137,7 @@ export async function applyInstallersOver(
   for (const svc of services) {
     const installer = await pickInstaller(svc.dir)
     if (!installer) continue
-    const plan: InstallPlan = await installer.plan(svc.dir)
+    const plan: InstallPlan = await installer.plan(svc.dir, { project })
     if (isEmptyPlan(plan) && !plan.libOnly) {
       already++
       continue
@@ -316,7 +319,7 @@ export async function runOrchestrator(opts: OrchestratorOptions): Promise<Orches
     result.steps.apply.skipped = true
     console.log('skipped instrumentation (--no-instrument)')
   } else {
-    const tally = await applyInstallersOver(services)
+    const tally = await applyInstallersOver(services, opts.project)
     result.steps.apply = { ...tally, skipped: false }
     console.log(
       `instrumented ${tally.instrumented}, already ${tally.alreadyInstrumented}, lib-only ${tally.libOnly}`,

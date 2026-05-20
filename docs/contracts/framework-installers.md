@@ -8,7 +8,7 @@ adr: [ADR-074, ADR-073, ADR-047, ADR-069, ADR-070]
 
 # Framework installer paths contract
 
-Amends [`sdk-install.md`](./sdk-install.md) for the four meta-frameworks beyond Next.js. The four-deps invariant, the lockfiles-never rule, the plan/apply decoupling, and the `.env.neat` `OTEL_SERVICE_NAME` shape from ADR-047 / ADR-069 all hold for every framework branch. Each branch adds one `plan<Framework>` function and one detection-chain entry in `plan()`.
+Amends [`sdk-install.md`](./sdk-install.md) for the four meta-frameworks beyond Next.js. The four-deps invariant, the lockfiles-never rule, the plan/apply decoupling, and the per-project `.env.neat` `OTEL_SERVICE_NAME` shape from [`sdk-install.md`](./sdk-install.md) §Per-project (amended v0.4.1 — refs #339) all hold for every framework branch. Each branch adds one `plan<Framework>` function and one detection-chain entry in `plan()`, and threads the project name through `planNext` / `planRemix` / `planSvelteKit` / `planNuxt` / `planAstro` to the shared `queueEnvNeat` helper.
 
 Six sections, one rule each.
 

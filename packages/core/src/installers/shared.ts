@@ -101,6 +101,15 @@ export interface ApplyResult {
   writtenFiles: string[]
 }
 
+// Plan-time inputs the orchestrator threads through (v0.4.1 — refs #339).
+// `project` is the registered project name — the routing key the daemon
+// owns. When present the installer writes it as `OTEL_SERVICE_NAME` so the
+// OTLP wire and the registry agree end-to-end. Absent → installers fall
+// back to a package-local default for ad-hoc / test usage.
+export interface PlanOptions {
+  project?: string
+}
+
 export interface Installer {
   // Free-form module name. Used for the patch header and for diagnostics.
   name: string
@@ -110,7 +119,7 @@ export interface Installer {
   // Builds an `InstallPlan` describing the edits the installer would make.
   // Pure data; no fs writes. An empty plan (every edits array empty) means
   // the SDK is already installed and there is nothing to do.
-  plan(serviceDir: string): InstallPlan | Promise<InstallPlan>
+  plan(serviceDir: string, opts?: PlanOptions): InstallPlan | Promise<InstallPlan>
   // Apply a previously-produced plan. Mutates files in place. On failure,
   // produces `<serviceDir>/neat-rollback.patch` per ADR-047 #7. Returns a
   // structured outcome so the CLI can surface coverage (ADR-069 §9).

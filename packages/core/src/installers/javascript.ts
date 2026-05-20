@@ -32,6 +32,7 @@ import type {
   GeneratedFile,
   Installer,
   InstallPlan,
+  PlanOptions,
 } from './shared.js'
 import {
   ASTRO_MIDDLEWARE_JS,
@@ -88,6 +89,20 @@ interface PackageJsonShape {
   scripts?: Record<string, string>
   dependencies?: Record<string, string>
   devDependencies?: Record<string, string>
+}
+
+// Resolve the `.env.neat` OTEL_SERVICE_NAME value. v0.4.1 / refs #339 — the
+// daemon routes spans by registered project name, so the env file must carry
+// that name. When the orchestrator threads a project through we use it
+// verbatim; ad-hoc / test usage falls back to the package's own name so the
+// generated file is still well-formed.
+function envServiceName(
+  pkg: PackageJsonShape,
+  serviceDir: string,
+  project: string | undefined,
+): string {
+  if (project && project.length > 0) return project
+  return pkg.name ?? path.basename(serviceDir)
 }
 
 async function readPackageJson(serviceDir: string): Promise<PackageJsonShape | null> {
@@ -424,6 +439,7 @@ async function planNext(
   pkg: PackageJsonShape,
   manifestPath: string,
   nextConfigPath: string,
+  project: string | undefined,
 ): Promise<InstallPlan> {
   const useTs = await isTypeScriptProject(serviceDir)
   const instrumentationFile = path.join(serviceDir, useTs ? 'instrumentation.ts' : 'instrumentation.js')
@@ -467,7 +483,7 @@ async function planNext(
   if (!(await exists(envNeatFile))) {
     generatedFiles.push({
       file: envNeatFile,
-      contents: renderEnvNeat(pkg.name ?? path.basename(serviceDir)),
+      contents: renderEnvNeat(envServiceName(pkg, serviceDir, project)),
       skipIfExists: true,
     })
   }
@@ -550,13 +566,14 @@ function buildDependencyEdits(
 async function queueEnvNeat(
   serviceDir: string,
   pkg: PackageJsonShape,
+  project: string | undefined,
   generatedFiles: GeneratedFile[],
 ): Promise<void> {
   const envNeatFile = path.join(serviceDir, '.env.neat')
   if (!(await exists(envNeatFile))) {
     generatedFiles.push({
       file: envNeatFile,
-      contents: renderEnvNeat(pkg.name ?? path.basename(serviceDir)),
+      contents: renderEnvNeat(envServiceName(pkg, serviceDir, project)),
       skipIfExists: true,
     })
   }
@@ -582,6 +599,7 @@ async function planRemix(
   pkg: PackageJsonShape,
   manifestPath: string,
   entryFile: string,
+  project: string | undefined,
 ): Promise<InstallPlan> {
   const useTs = await isTypeScriptProject(serviceDir)
   const otelServerFile = path.join(
@@ -599,7 +617,7 @@ async function planRemix(
       skipIfExists: true,
     })
   }
-  await queueEnvNeat(serviceDir, pkg, generatedFiles)
+  await queueEnvNeat(serviceDir, pkg, project, generatedFiles)
 
   const entrypointEdits: EntrypointEdit[] = []
   try {
@@ -650,6 +668,7 @@ async function planSvelteKit(
   pkg: PackageJsonShape,
   manifestPath: string,
   hooksFile: string | null,
+  project: string | undefined,
 ): Promise<InstallPlan> {
   const useTs = await isTypeScriptProject(serviceDir)
   const otelInitFile = path.join(
@@ -671,7 +690,7 @@ async function planSvelteKit(
       skipIfExists: true,
     })
   }
-  await queueEnvNeat(serviceDir, pkg, generatedFiles)
+  await queueEnvNeat(serviceDir, pkg, project, generatedFiles)
 
   if (hooksFile === null) {
     generatedFiles.push({
@@ -728,6 +747,7 @@ async function planNuxt(
   serviceDir: string,
   pkg: PackageJsonShape,
   manifestPath: string,
+  project: string | undefined,
 ): Promise<InstallPlan> {
   const useTs = await isTypeScriptProject(serviceDir)
   const otelPluginFile = path.join(
@@ -756,7 +776,7 @@ async function planNuxt(
       skipIfExists: true,
     })
   }
-  await queueEnvNeat(serviceDir, pkg, generatedFiles)
+  await queueEnvNeat(serviceDir, pkg, project, generatedFiles)
 
   const empty = dependencyEdits.length === 0 && generatedFiles.length === 0
 
@@ -797,6 +817,7 @@ async function planAstro(
   serviceDir: string,
   pkg: PackageJsonShape,
   manifestPath: string,
+  project: string | undefined,
 ): Promise<InstallPlan> {
   const useTs = await isTypeScriptProject(serviceDir)
   const otelInitFile = path.join(
@@ -819,7 +840,7 @@ async function planAstro(
       skipIfExists: true,
     })
   }
-  await queueEnvNeat(serviceDir, pkg, generatedFiles)
+  await queueEnvNeat(serviceDir, pkg, project, generatedFiles)
 
   if (existingMiddleware === null) {
     generatedFiles.push({
@@ -872,9 +893,10 @@ async function planAstro(
   }
 }
 
-async function plan(serviceDir: string): Promise<InstallPlan> {
+async function plan(serviceDir: string, opts?: PlanOptions): Promise<InstallPlan> {
   const pkg = await readPackageJson(serviceDir)
   const manifestPath = path.join(serviceDir, 'package.json')
+  const project = opts?.project
   const empty: InstallPlan = {
     language: 'javascript',
     serviceDir,
@@ -894,32 +916,32 @@ async function plan(serviceDir: string): Promise<InstallPlan> {
   if (hasNextDependency(pkg)) {
     const nextConfig = await findNextConfig(serviceDir)
     if (nextConfig) {
-      return planNext(serviceDir, pkg, manifestPath, nextConfig)
+      return planNext(serviceDir, pkg, manifestPath, nextConfig, project)
     }
   }
   if (hasRemixDependency(pkg)) {
     const remixEntry = await findRemixEntry(serviceDir)
     if (remixEntry) {
-      return planRemix(serviceDir, pkg, manifestPath, remixEntry)
+      return planRemix(serviceDir, pkg, manifestPath, remixEntry, project)
     }
   }
   if (hasSvelteKitDependency(pkg)) {
     const hooks = await findSvelteKitHooks(serviceDir)
     const config = await findSvelteKitConfig(serviceDir)
     if (hooks || config) {
-      return planSvelteKit(serviceDir, pkg, manifestPath, hooks)
+      return planSvelteKit(serviceDir, pkg, manifestPath, hooks, project)
     }
   }
   if (hasNuxtDependency(pkg)) {
     const nuxtConfig = await findNuxtConfig(serviceDir)
     if (nuxtConfig) {
-      return planNuxt(serviceDir, pkg, manifestPath)
+      return planNuxt(serviceDir, pkg, manifestPath, project)
     }
   }
   if (hasAstroDependency(pkg)) {
     const astroConfig = await findAstroConfig(serviceDir)
     if (astroConfig) {
-      return planAstro(serviceDir, pkg, manifestPath)
+      return planAstro(serviceDir, pkg, manifestPath, project)
     }
   }
 
@@ -981,7 +1003,7 @@ async function plan(serviceDir: string): Promise<InstallPlan> {
   if (!(await exists(envNeatFile))) {
     generatedFiles.push({
       file: envNeatFile,
-      contents: renderEnvNeat(pkg.name ?? path.basename(serviceDir)),
+      contents: renderEnvNeat(envServiceName(pkg, serviceDir, project)),
       skipIfExists: true,
     })
   }
