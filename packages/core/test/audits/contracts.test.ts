@@ -4344,6 +4344,10 @@ describe('Daemon contract (ADR-049)', () => {
     try {
       const { startDaemon } = await import('../../src/daemon.js')
       const handle = await startDaemon()
+      // Issue #340 — startDaemon now resolves on listener bind; tests probing
+      // project-scoped routes await the initial bootstrap so the slots load
+      // before the first request.
+      await handle.initialBootstrap
       try {
         // Both projects appear in slots; the missing-path one is marked
         // broken, the surviving one is active and producing a snapshot.
@@ -4544,6 +4548,10 @@ describe('Daemon contract (ADR-049)', () => {
     try {
       const { startDaemon } = await import('../../src/daemon.js')
       const handle = await startDaemon()
+      // Issue #340 — startDaemon now resolves on listener bind; tests probing
+      // project-scoped routes await the initial bootstrap so the slots load
+      // before the first request.
+      await handle.initialBootstrap
       try {
         expect(handle.pidPath).toBe(path2.join(home, 'neatd.pid'))
         const pidRaw = await fs2.readFile(handle.pidPath, 'utf8')
@@ -4571,6 +4579,10 @@ describe('Daemon contract (ADR-049)', () => {
     try {
       const { startDaemon } = await import('../../src/daemon.js')
       const handle = await startDaemon()
+      // Issue #340 — startDaemon now resolves on listener bind; tests probing
+      // project-scoped routes await the initial bootstrap so the slots load
+      // before the first request.
+      await handle.initialBootstrap
       try {
         expect(handle.slots.has('first')).toBe(true)
         expect(handle.slots.has('second')).toBe(false)
@@ -4624,6 +4636,10 @@ describe('Daemon contract (ADR-049)', () => {
       const t0 = Date.now()
       const { startDaemon } = await import('../../src/daemon.js')
       const handle = await startDaemon()
+      // Issue #340 — startDaemon now resolves on listener bind; tests probing
+      // project-scoped routes await the initial bootstrap so the slots load
+      // before the first request.
+      await handle.initialBootstrap
       try {
         expect(handle.restAddress).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/)
         const res = await fetch(`${handle.restAddress}/graph`)
@@ -4653,6 +4669,10 @@ describe('Daemon contract (ADR-049)', () => {
       const t0 = Date.now()
       const { startDaemon } = await import('../../src/daemon.js')
       const handle = await startDaemon()
+      // Issue #340 — startDaemon now resolves on listener bind; tests probing
+      // project-scoped routes await the initial bootstrap so the slots load
+      // before the first request.
+      await handle.initialBootstrap
       try {
         expect(handle.otlpAddress).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/)
         // /health is the cheap liveness probe wired in buildOtelReceiver.
@@ -4673,6 +4693,83 @@ describe('Daemon contract (ADR-049)', () => {
     }
   })
 
+  it('issue #340 — startDaemon resolves on listener bind, bootstrap continues in background', async () => {
+    const { home, cleanup } = await setupDaemonSandbox({
+      projects: [{ name: 'default' }, { name: 'second' }, { name: 'third' }],
+    })
+    const prevWarn = console.warn
+    const prevLog = console.log
+    console.warn = () => {}
+    console.log = () => {}
+    try {
+      const { startDaemon } = await import('../../src/daemon.js')
+      const handle = await startDaemon()
+      try {
+        // Listener up immediately; bootstrap tracker reports every project
+        // still in flight or already settled, but the start call returned.
+        expect(handle.restAddress).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/)
+        const phases = handle.bootstrap.list()
+        expect(phases.length).toBe(3)
+        // After awaiting initialBootstrap, every slot has settled.
+        await handle.initialBootstrap
+        const settled = handle.bootstrap.list()
+        for (const p of settled) {
+          expect(['active', 'broken']).toContain(p.status)
+        }
+      } finally {
+        await handle.stop()
+      }
+      void home
+    } finally {
+      console.warn = prevWarn
+      console.log = prevLog
+      await cleanup()
+    }
+  })
+
+  it('issue #340 — project-scoped routes return 503 ready=false while a slot is still bootstrapping', async () => {
+    // Build a Fastify app from buildApi directly so we can control the
+    // bootstrap-tracker map without racing the daemon's real bootstrap.
+    const { buildApi } = await import('../../src/api.js')
+    const { Projects } = await import('../../src/projects.js')
+    const registry = new Projects()
+    const status = new Map<string, 'bootstrapping' | 'active' | 'broken'>([
+      ['pending-project', 'bootstrapping'],
+    ])
+    const app = await buildApi({
+      projects: registry,
+      bootstrap: {
+        status: (name) => status.get(name),
+        list: () =>
+          [...status.entries()].map(([name, s]) => ({
+            name,
+            status: s,
+            elapsedMs: 0,
+          })),
+      },
+    })
+    try {
+      const res = await app.inject({
+        method: 'GET',
+        url: '/projects/pending-project/graph',
+      })
+      expect(res.statusCode).toBe(503)
+      const body = res.json() as { ready: boolean; project: string; status: string }
+      expect(body.ready).toBe(false)
+      expect(body.project).toBe('pending-project')
+      expect(body.status).toBe('bootstrapping')
+
+      // Unknown project (not in registry, not in bootstrap tracker) still 404s.
+      const unknown = await app.inject({
+        method: 'GET',
+        url: '/projects/unknown/graph',
+      })
+      expect(unknown.statusCode).toBe(404)
+    } finally {
+      await app.close()
+    }
+  })
+
   it('ADR-063 — every registered project answers GET /projects/:project/graph with 200', async () => {
     const { home, cleanup } = await setupDaemonSandbox({
       projects: [{ name: 'default' }, { name: 'second' }, { name: 'third' }],
@@ -4684,6 +4781,10 @@ describe('Daemon contract (ADR-049)', () => {
     try {
       const { startDaemon } = await import('../../src/daemon.js')
       const handle = await startDaemon()
+      // Issue #340 — startDaemon now resolves on listener bind; tests probing
+      // project-scoped routes await the initial bootstrap so the slots load
+      // before the first request.
+      await handle.initialBootstrap
       try {
         for (const name of ['default', 'second', 'third']) {
           const res = await fetch(`${handle.restAddress}/projects/${name}/graph`)
@@ -4743,6 +4844,10 @@ describe('Daemon contract (ADR-049)', () => {
     try {
       const { startDaemon } = await import('../../src/daemon.js')
       const handle = await startDaemon()
+      // Issue #340 — startDaemon now resolves on listener bind; tests probing
+      // project-scoped routes await the initial bootstrap so the slots load
+      // before the first request.
+      await handle.initialBootstrap
       try {
         // Slot starts broken because the path was yanked.
         expect(handle.slots.get('recoverable')?.status).toBe('broken')
@@ -4827,6 +4932,10 @@ describe('Daemon contract (ADR-049)', () => {
     try {
       const { startDaemon } = await import('../../src/daemon.js')
       const handle = await startDaemon()
+      // Issue #340 — startDaemon now resolves on listener bind; tests probing
+      // project-scoped routes await the initial bootstrap so the slots load
+      // before the first request.
+      await handle.initialBootstrap
       try {
         async function postSpan(): Promise<void> {
           await fetch(`${handle.otlpAddress}/v1/traces`, {
@@ -4898,6 +5007,10 @@ describe('Daemon contract (ADR-049)', () => {
     try {
       const { startDaemon } = await import('../../src/daemon.js')
       const handle = await startDaemon()
+      // Issue #340 — startDaemon now resolves on listener bind; tests probing
+      // project-scoped routes await the initial bootstrap so the slots load
+      // before the first request.
+      await handle.initialBootstrap
       try {
         expect(handle.slots.get('sighup-recoverable')?.status).toBe('broken')
 

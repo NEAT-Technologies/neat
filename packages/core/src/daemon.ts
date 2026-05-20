@@ -77,6 +77,17 @@ export interface ProjectSlot {
   errorReason?: string
 }
 
+// Issue #340 — per-project bootstrap state surface. The REST listener
+// flips to live the moment `app.listen()` returns; per-project routes
+// branch on this rather than waiting for every registered project's
+// extractFromDirectory pass to finish.
+export type BootstrapPhase = 'bootstrapping' | 'active' | 'broken'
+
+export interface BootstrapTracker {
+  status: (name: string) => BootstrapPhase | undefined
+  list: () => Array<{ name: string; status: BootstrapPhase; elapsedMs: number }>
+}
+
 export interface DaemonHandle {
   // The slots currently being managed, keyed by project name. Tests inspect
   // this to assert isolation properties.
@@ -94,6 +105,13 @@ export interface DaemonHandle {
   // OTLP is the receiver's.
   restAddress: string
   otlpAddress: string
+  // Issue #340 — per-project bootstrap status, surfaced for orchestrator
+  // poll loops and tests.
+  bootstrap: BootstrapTracker
+  // Resolves when the daemon's initial bootstrap pass has settled. Tests
+  // that probe project-scoped routes immediately after startDaemon await
+  // this; production callers use /health.
+  initialBootstrap: Promise<void>
 }
 
 function neatHomeFor(opts: DaemonOptions): string {
@@ -278,6 +296,11 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<DaemonHandl
   // Projects registry mirrors slots for the REST listener (ADR-063). buildApi
   // reads from this; we keep it in sync as slots come and go.
   const registry = new Projects()
+  // Issue #340 — per-project bootstrap status. Populated from the registry
+  // before the listener binds so the REST handlers can return 503 instead of
+  // 404 for projects still extracting.
+  const bootstrapStatus = new Map<string, BootstrapPhase>()
+  const bootstrapStartedAt = new Map<string, number>()
 
   // Rate-limit the dropped-span warning to one log line per project per
   // 60 seconds. OTel exporters retry on a tight cadence; without this we
@@ -355,39 +378,43 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<DaemonHandl
     }
   }
 
+  async function bootstrapOne(entry: RegistryEntry): Promise<void> {
+    bootstrapStatus.set(entry.name, 'bootstrapping')
+    bootstrapStartedAt.set(entry.name, Date.now())
+    try {
+      const slot = await bootstrapProject(entry)
+      slots.set(entry.name, slot)
+      upsertRegistryFromSlot(slot)
+      bootstrapStatus.set(entry.name, slot.status === 'broken' ? 'broken' : 'active')
+      if (slot.status === 'broken') {
+        console.warn(`neatd: project "${entry.name}" broken — ${slot.errorReason}`)
+      } else {
+        console.log(`neatd: project "${entry.name}" active (${entry.path})`)
+      }
+    } catch (err) {
+      bootstrapStatus.set(entry.name, 'broken')
+      console.warn(
+        `neatd: project "${entry.name}" failed to bootstrap — ${(err as Error).message}`,
+      )
+      await setStatus(entry.name, 'broken').catch(() => {})
+    }
+  }
+
   async function loadAll(): Promise<void> {
     const projects = await listProjects()
     const seen = new Set<string>()
+    const pending: Promise<void>[] = []
     for (const entry of projects) {
       seen.add(entry.name)
       const existing = slots.get(entry.name)
       if (existing) {
-        // SIGHUP shortcut: re-bootstrap any slot currently in `broken`. The
-        // operator's mental model for `neatd reload` is "look at the world
-        // again," so a broken slot that became reachable between boots gets
-        // a second chance.
         if (existing.status === 'broken') {
-          await tryRecoverSlot(entry)
+          pending.push(tryRecoverSlot(entry).then(() => {}))
         }
         continue
       }
-      try {
-        const slot = await bootstrapProject(entry)
-        slots.set(entry.name, slot)
-        upsertRegistryFromSlot(slot)
-        if (slot.status === 'broken') {
-          console.warn(`neatd: project "${entry.name}" broken — ${slot.errorReason}`)
-        } else {
-          console.log(`neatd: project "${entry.name}" active (${entry.path})`)
-        }
-      } catch (err) {
-        console.warn(
-          `neatd: project "${entry.name}" failed to bootstrap — ${(err as Error).message}`,
-        )
-        await setStatus(entry.name, 'broken').catch(() => {})
-      }
+      pending.push(bootstrapOne(entry))
     }
-    // Drop entries the registry no longer carries.
     for (const [name, slot] of [...slots.entries()]) {
       if (seen.has(name)) continue
       try {
@@ -396,11 +423,21 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<DaemonHandl
         // best-effort
       }
       slots.delete(name)
+      bootstrapStatus.delete(name)
+      bootstrapStartedAt.delete(name)
       console.log(`neatd: project "${name}" removed from registry — stopped`)
     }
+    await Promise.allSettled(pending)
   }
 
-  await loadAll()
+  // Issue #340 — pre-populate bootstrap status from the registry so the REST
+  // listener can answer 503 for projects whose slot hasn't loaded yet. Actual
+  // bootstrap moves to the background after `listen()` returns.
+  const initialEntries = await listProjects().catch(() => [] as RegistryEntry[])
+  for (const entry of initialEntries) {
+    bootstrapStatus.set(entry.name, 'bootstrapping')
+    bootstrapStartedAt.set(entry.name, Date.now())
+  }
 
   // ADR-063 — bind the REST host and the OTLP HTTP receiver. One listener
   // each, multi-tenant by project name in the URL (REST) and by service.name
@@ -430,6 +467,17 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<DaemonHandl
         authToken: auth.authToken,
         trustProxy: auth.trustProxy,
         publicRead: auth.publicRead,
+        bootstrap: {
+          status: (name) => bootstrapStatus.get(name),
+          list: () => {
+            const now = Date.now()
+            return [...bootstrapStatus.entries()].map(([name, status]) => ({
+              name,
+              status,
+              elapsedMs: now - (bootstrapStartedAt.get(name) ?? now),
+            }))
+          },
+        },
       })
       restAddress = await restApp.listen({ port: restPort, host })
       console.log(`neatd: REST listening on ${restAddress}`)
@@ -529,7 +577,13 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<DaemonHandl
     }
   }
 
-  let reloading: Promise<void> | null = null
+  // Issue #340 — listeners are live; kick off per-project bootstrap in the
+  // background. Polled callers watch /health for transitions.
+  const initialBootstrap = loadAll().catch((err) => {
+    console.warn(`neatd: initial bootstrap pass failed — ${(err as Error).message}`)
+  })
+
+  let reloading: Promise<void> | null = initialBootstrap
   const reload = async (): Promise<void> => {
     if (reloading) return reloading
     reloading = (async () => {
@@ -540,6 +594,21 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<DaemonHandl
       }
     })()
     return reloading
+  }
+  void initialBootstrap.finally(() => {
+    if (reloading === initialBootstrap) reloading = null
+  })
+
+  const tracker: BootstrapTracker = {
+    status: (name) => bootstrapStatus.get(name),
+    list: () => {
+      const now = Date.now()
+      return [...bootstrapStatus.entries()].map(([name, status]) => ({
+        name,
+        status,
+        elapsedMs: now - (bootstrapStartedAt.get(name) ?? now),
+      }))
+    },
   }
 
   // SIGHUP — external "reload your config" signal. ADR-049 #2.
@@ -567,5 +636,14 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<DaemonHandl
     await fs.unlink(pidPath).catch(() => {})
   }
 
-  return { slots, reload, stop, pidPath, restAddress, otlpAddress }
+  return {
+    slots,
+    reload,
+    stop,
+    pidPath,
+    restAddress,
+    otlpAddress,
+    bootstrap: tracker,
+    initialBootstrap,
+  }
 }
