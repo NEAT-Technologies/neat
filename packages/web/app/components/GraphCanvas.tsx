@@ -436,8 +436,11 @@ export function GraphCanvas({ project, selectedNodeId, onNodeSelect, onGraphLoad
       if (zOut) zOut.onclick = () => cy.zoom({ level: cy.zoom() / 1.2, renderedPosition: { x: cy.width() / 2, y: cy.height() / 2 } })
       if (zFit) zFit.onclick = () => cy.fit(undefined, 60)
 
-      // SSE live updates (graceful — pre-v0.2.8 will get unavailable error and stop)
-      const sse = new EventSource('/api/events')
+      // SSE live updates, scoped to the active project (ADR-051 dual-mount).
+      // Without the project param the daemon streams the default-project bus
+      // and every other registered project's events land on the same canvas,
+      // which reads as one merged graph across projects.
+      const sse = new EventSource(`/api/events?project=${encodeURIComponent(project)}`)
       sseRef.current = sse
 
       function pushGraphUpdate() {
