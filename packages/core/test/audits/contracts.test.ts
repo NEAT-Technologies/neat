@@ -4810,6 +4810,39 @@ describe('Daemon contract (ADR-049)', () => {
     }
   })
 
+  it('issue #341 — NEAT_AUTH_TOKEN unset + HOST unset → daemon binds on 127.0.0.1', async () => {
+    const { home, cleanup } = await setupDaemonSandbox({
+      projects: [{ name: 'default' }],
+    })
+    const prevHost = process.env.HOST
+    const prevToken = process.env.NEAT_AUTH_TOKEN
+    delete process.env.HOST
+    delete process.env.NEAT_AUTH_TOKEN
+    const prevWarn = console.warn
+    const prevLog = console.log
+    console.warn = () => {}
+    console.log = () => {}
+    try {
+      const { startDaemon } = await import('../../src/daemon.js')
+      const handle = await startDaemon()
+      try {
+        expect(handle.restAddress).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/)
+        expect(handle.otlpAddress).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/)
+      } finally {
+        await handle.stop()
+      }
+      void home
+    } finally {
+      console.warn = prevWarn
+      console.log = prevLog
+      if (prevHost === undefined) delete process.env.HOST
+      else process.env.HOST = prevHost
+      if (prevToken === undefined) delete process.env.NEAT_AUTH_TOKEN
+      else process.env.NEAT_AUTH_TOKEN = prevToken
+      await cleanup()
+    }
+  })
+
   it('issue #340 — project-scoped routes return 503 ready=false while a slot is still bootstrapping', async () => {
     // Build a Fastify app from buildApi directly so we can control the
     // bootstrap-tracker map without racing the daemon's real bootstrap.
@@ -9093,6 +9126,29 @@ describe('ADR-073 — one-command CLI + deployment-target + delegated auth', () 
     }
     // Non-loopback IPv4 outside 127.* is also refused.
     expect(() => assertBindAuthority('10.0.0.5', undefined)).toThrow(BindAuthorityError)
+  })
+
+  it('issue #341 — NEAT_AUTH_TOKEN unset + HOST unset: source assertion that daemon defaults to 127.0.0.1', () => {
+    // Static assertion — the resolveHost helper applies the loopback default
+    // when neither HOST nor NEAT_AUTH_TOKEN is set. The daemon-binding test
+    // for the same path lives inside the Daemon contract describe block so it
+    // can share setupDaemonSandbox.
+    const daemon = readFileSync(join(CORE_SRC, 'daemon.ts'), 'utf8')
+    expect(daemon).toMatch(/if \(!authTokenSet\) return '127\.0\.0\.1'/)
+  })
+
+  it('issue #341 — orchestrator pins HOST=127.0.0.1 in the daemon child env when NEAT_AUTH_TOKEN is unset', () => {
+    // The orchestrator spawns neatd as a detached child. The HOST handoff
+    // belongs to the parent — the child can't fix a pre-set HOST=0.0.0.0
+    // because by the time the daemon evaluates it, `assertBindAuthority`
+    // has already refused. Asserting on the source keeps the gate cost low.
+    const orchestrator = readFileSync(join(CORE_SRC, 'orchestrator.ts'), 'utf8')
+    expect(orchestrator).toMatch(/NEAT_AUTH_TOKEN/)
+    expect(orchestrator).toMatch(/env\.HOST\s*=\s*'127\.0\.0\.1'/)
+    // The daemon's stderr inherits the orchestrator's so the
+    // BindAuthorityError message reaches the operator instead of being
+    // swallowed.
+    expect(orchestrator).toMatch(/stdio:\s*\[[^\]]*'inherit'[^\]]*\]/)
   })
 
   it('ADR-073 §3 — NEAT_AUTH_TOKEN unset + loopback bind: daemon starts unauthenticated (laptop dev path)', async () => {
