@@ -305,7 +305,13 @@ async function waitForDaemonReady(restPort: number, timeoutMs: number): Promise<
   }
 }
 
-function spawnDaemonDetached(): void {
+// Spawn the daemon as a child process the orchestrator drives. Returns the
+// child handle so the caller can read its stderr verbatim when the bind
+// gate (or any other startup failure) reports back through that pipe
+// (issue #341). The `detached: true` + `unref()` pair survives the
+// orchestrator exiting cleanly; the inherited stderr keeps the operator
+// informed when something does fail.
+function spawnDaemonDetached(): import('node:child_process').ChildProcess {
   // Resolve the neatd entry inside the @neat.is/core dist next to this
   // file. `import.meta.url` is post-bundling — at runtime, this resolves
   // to `<core>/dist/neatd.{js,cjs}`. We pick the .cjs because tsup ships
@@ -330,12 +336,30 @@ function spawnDaemonDetached(): void {
   if (!entry) {
     throw new Error(`orchestrator: cannot locate neatd entry in ${here}`)
   }
+
+  // ADR-073 §3 + issue #341 — first-touch path is loopback-only. When the
+  // operator hasn't set `NEAT_AUTH_TOKEN` the orchestrator hard-pins
+  // HOST=127.0.0.1 in the child env so `assertBindAuthority` lets the bind
+  // through. Public-bind is opt-in via the token (and an explicit
+  // `HOST=0.0.0.0` if the operator wants the literal). The parent's HOST is
+  // preserved untouched when the token is set — that's the deploy path,
+  // where the platform owns the bind decision.
+  const env = { ...process.env }
+  const hasToken = typeof env.NEAT_AUTH_TOKEN === 'string' && env.NEAT_AUTH_TOKEN.length > 0
+  if (!hasToken && (!env.HOST || env.HOST.length === 0)) {
+    env.HOST = '127.0.0.1'
+  }
+
   const child = spawn(process.execPath, [entry, 'start'], {
     detached: true,
-    stdio: 'ignore',
-    env: process.env,
+    // stderr inherits the orchestrator's fd so the daemon's
+    // `BindAuthorityError` message lands in front of the operator instead
+    // of being swallowed (issue #341).
+    stdio: ['ignore', 'ignore', 'inherit'],
+    env,
   })
   child.unref()
+  return child
 }
 
 function openBrowser(url: string): 'opened' | 'failed' {

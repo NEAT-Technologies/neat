@@ -269,10 +269,18 @@ function resolveOtlpPort(opts: DaemonOptions): number {
   return 4318
 }
 
-function resolveHost(opts: DaemonOptions): string {
+function resolveHost(opts: DaemonOptions, authTokenSet: boolean): string {
   if (opts.host && opts.host.length > 0) return opts.host
   const env = process.env.HOST
   if (env && env.length > 0) return env
+  // Issue #341 — loopback-only default when the operator hasn't set a token.
+  // Public-bind on a clean install demanded one before binding could
+  // succeed, so the npx-`neat .` first-touch path used to refuse to come up;
+  // pinning to 127.0.0.1 lets that path bind cleanly. Anyone wanting a
+  // public bind sets `NEAT_AUTH_TOKEN` (and `HOST=0.0.0.0` if they want it
+  // spelled out). `assertBindAuthority` stays exactly as it is — the
+  // contract is right; the default was wrong.
+  if (!authTokenSet) return '127.0.0.1'
   return '0.0.0.0'
 }
 
@@ -452,13 +460,15 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<DaemonHandl
   let otlpAddress = ''
 
   if (bind) {
-    const host = resolveHost(opts)
+    // ADR-073 §3 — fail-loud before binding. Loopback-only without a token is
+    // fine (laptop dev); a public bind without one is not. Resolved here
+    // ahead of the host so the loopback-default branch (issue #341) reads
+    // the same token state the bind-authority gate does.
+    const auth = readAuthEnv()
+    const host = resolveHost(opts, Boolean(auth.authToken))
     const restPort = resolveRestPort(opts)
     const otlpPort = resolveOtlpPort(opts)
 
-    // ADR-073 §3 — fail-loud before binding. Loopback-only without a token is
-    // fine (laptop dev); a public bind without one is not.
-    const auth = readAuthEnv()
     assertBindAuthority(host, auth.authToken)
 
     try {
