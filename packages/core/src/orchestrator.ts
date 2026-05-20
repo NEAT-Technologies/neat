@@ -32,7 +32,7 @@ import { discoverServices } from './extract/services.js'
 import { ensureNeatOutIgnored } from './gitignore.js'
 import { saveGraphToDisk } from './persist.js'
 import { pathsForProject } from './projects.js'
-import { addProject, ProjectNameCollisionError } from './registry.js'
+import { addProject, listProjects, ProjectNameCollisionError } from './registry.js'
 import {
   isEmptyPlan,
   pickInstaller,
@@ -158,35 +158,148 @@ async function promptYesNo(question: string): Promise<boolean> {
   })
 }
 
-// 15s is enough for boot + per-project graph load on a laptop. Faster on
-// repeat runs (graph slot warm); the timeout kicks in only when something
-// is genuinely wrong.
-const DEFAULT_DAEMON_READY_TIMEOUT_MS = 15_000
+// 60s covers boot + per-project graph load across a registry with several
+// sibling projects. Issue #340 — `app.listen()` now returns the moment the
+// socket binds, so the steady-state happy path lands well inside the first
+// second; the longer ceiling is the cold-clone window where multi-project
+// bootstraps run in the background after listen.
+const DEFAULT_DAEMON_READY_TIMEOUT_MS = 60_000
 
-async function checkDaemonHealth(restPort: number): Promise<boolean> {
+// 500ms poll cadence — responsive enough that the operator sees a fresh
+// status line on every transition without spamming the daemon.
+const PROBE_INTERVAL_MS = 500
+
+interface DaemonHealthResponse {
+  ok?: boolean
+  uptimeMs?: number
+  projects?: Array<{
+    name: string
+    status?: 'bootstrapping' | 'active' | 'broken'
+    elapsedMs?: number
+  }>
+}
+
+async function fetchDaemonHealth(restPort: number): Promise<DaemonHealthResponse | null> {
   return new Promise((resolve) => {
     const req = http.get(`http://127.0.0.1:${restPort}/health`, (res) => {
-      // Any 2xx counts — the response body has the project list, which
-      // doesn't gate the orchestrator's "is it up" question.
       const ok = res.statusCode !== undefined && res.statusCode >= 200 && res.statusCode < 300
-      res.resume()
-      resolve(ok)
+      if (!ok) {
+        res.resume()
+        resolve(null)
+        return
+      }
+      let body = ''
+      res.setEncoding('utf8')
+      res.on('data', (chunk: string) => { body += chunk })
+      res.on('end', () => {
+        try {
+          resolve(JSON.parse(body) as DaemonHealthResponse)
+        } catch {
+          resolve({ ok: true })
+        }
+      })
     })
-    req.on('error', () => resolve(false))
+    req.on('error', () => resolve(null))
     req.setTimeout(1000, () => {
       req.destroy()
-      resolve(false)
+      resolve(null)
     })
   })
 }
 
-async function waitForDaemonReady(restPort: number, timeoutMs: number): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs
-  while (Date.now() < deadline) {
-    if (await checkDaemonHealth(restPort)) return true
-    await new Promise((r) => setTimeout(r, 300))
+async function checkDaemonHealth(restPort: number): Promise<boolean> {
+  const body = await fetchDaemonHealth(restPort)
+  return body !== null
+}
+
+async function probeProjectHealth(
+  restPort: number,
+  name: string,
+): Promise<'bootstrapping' | 'active' | 'broken'> {
+  return new Promise((resolve) => {
+    const req = http.get(
+      `http://127.0.0.1:${restPort}/projects/${encodeURIComponent(name)}/health`,
+      (res) => {
+        const code = res.statusCode ?? 0
+        res.resume()
+        if (code >= 200 && code < 300) resolve('active')
+        else resolve('bootstrapping')
+      },
+    )
+    req.on('error', () => resolve('bootstrapping'))
+    req.setTimeout(1000, () => {
+      req.destroy()
+      resolve('bootstrapping')
+    })
+  })
+}
+
+// Resolve the project-status set the wait loop branches on. Prefers the
+// daemon-wide /health response when it carries the list; otherwise reads
+// the registry directly and probes each project's per-project /health.
+// The fallback handles the case where the daemon-wide /health hasn't
+// landed in this branch's main yet.
+async function snapshotProjectStatus(
+  restPort: number,
+  body: DaemonHealthResponse,
+): Promise<Array<{ name: string; status: 'bootstrapping' | 'active' | 'broken' }>> {
+  if (body.projects && body.projects.length > 0) {
+    return body.projects.map((p) => ({
+      name: p.name,
+      status: p.status ?? 'active',
+    }))
   }
-  return false
+  const entries = await listProjects().catch(() => [])
+  if (entries.length === 0) return []
+  return Promise.all(
+    entries.map(async (entry) => ({
+      name: entry.name,
+      status: await probeProjectHealth(restPort, entry.name),
+    })),
+  )
+}
+
+interface DaemonReadyResult {
+  ready: boolean
+  brokenProjects: string[]
+  stillBootstrapping: string[]
+}
+
+async function waitForDaemonReady(restPort: number, timeoutMs: number): Promise<DaemonReadyResult> {
+  const deadline = Date.now() + timeoutMs
+  let lastBootstrapping: string[] = []
+  while (Date.now() < deadline) {
+    const body = await fetchDaemonHealth(restPort)
+    if (body !== null) {
+      const projects = await snapshotProjectStatus(restPort, body)
+      const bootstrapping = projects
+        .filter((p) => p.status === 'bootstrapping')
+        .map((p) => p.name)
+      const broken = projects.filter((p) => p.status === 'broken').map((p) => p.name)
+      if (bootstrapping.length === 0) {
+        return { ready: true, brokenProjects: broken, stillBootstrapping: [] }
+      }
+      const key = bootstrapping.slice().sort().join(',')
+      const prevKey = lastBootstrapping.slice().sort().join(',')
+      if (key !== prevKey) {
+        const plural = bootstrapping.length === 1 ? '' : 's'
+        console.log(
+          `neat: waiting on ${bootstrapping.length} project${plural}: ${bootstrapping.join(', ')}`,
+        )
+        lastBootstrapping = bootstrapping
+      }
+    }
+    await new Promise((r) => setTimeout(r, PROBE_INTERVAL_MS))
+  }
+  const final = await fetchDaemonHealth(restPort)
+  const projects = final ? await snapshotProjectStatus(restPort, final) : []
+  return {
+    ready: false,
+    brokenProjects: projects.filter((p) => p.status === 'broken').map((p) => p.name),
+    stillBootstrapping: projects
+      .filter((p) => p.status === 'bootstrapping')
+      .map((p) => p.name),
+  }
 }
 
 function spawnDaemonDetached(): void {
@@ -337,11 +450,24 @@ export async function runOrchestrator(opts: OrchestratorOptions): Promise<Orches
       return result
     }
     const ready = await waitForDaemonReady(restPort, timeoutMs)
-    result.steps.daemon = ready ? 'spawned' : 'timed-out'
-    if (!ready) {
+    result.steps.daemon = ready.ready ? 'spawned' : 'timed-out'
+    if (!ready.ready) {
       console.error(`neat: daemon did not become ready within ${timeoutMs}ms`)
+      if (ready.stillBootstrapping.length > 0) {
+        console.error(
+          `neat: still bootstrapping: ${ready.stillBootstrapping.join(', ')}`,
+        )
+      }
+      if (ready.brokenProjects.length > 0) {
+        console.error(`neat: broken projects: ${ready.brokenProjects.join(', ')}`)
+      }
       result.exitCode = 1
       return result
+    }
+    if (ready.brokenProjects.length > 0) {
+      console.warn(
+        `neat: ${ready.brokenProjects.length} project(s) reported broken: ${ready.brokenProjects.join(', ')}`,
+      )
     }
   }
 

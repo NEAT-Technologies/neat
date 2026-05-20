@@ -66,6 +66,13 @@ export interface BuildApiOptions {
   // bypass the bearer check; writes still require it. OTLP ingest is gated
   // independently and is unaffected by this flag.
   publicRead?: boolean
+  // Issue #340 — per-project bootstrap status. When provided, project-scoped
+  // routes for projects still extracting return 503 with `{ready: false}`
+  // instead of 404.
+  bootstrap?: {
+    status: (name: string) => 'bootstrapping' | 'active' | 'broken' | undefined
+    list: () => Array<{ name: string; status: 'bootstrapping' | 'active' | 'broken'; elapsedMs: number }>
+  }
 }
 
 interface SerializedGraph {
@@ -97,10 +104,22 @@ function resolveProject(
   registry: Projects,
   req: FastifyRequest,
   reply: FastifyReply,
+  bootstrap?: BuildApiOptions['bootstrap'],
 ): ProjectContext | null {
   const name = projectFromReq(req)
   const ctx = registry.get(name)
   if (!ctx) {
+    // Issue #340 — registered but still bootstrapping: surface 503 so the
+    // probe consumer knows the project is real and incoming, not missing.
+    const phase = bootstrap?.status(name)
+    if (phase === 'bootstrapping') {
+      void reply.code(503).send({ ready: false, project: name, status: 'bootstrapping' })
+      return null
+    }
+    if (phase === 'broken') {
+      void reply.code(503).send({ ready: false, project: name, status: 'broken' })
+      return null
+    }
     void reply.code(404).send({ error: 'project not found', project: name })
     return null
   }
@@ -142,6 +161,9 @@ interface RouteContext {
   // policy.json lives at the project root (per ADR-042 §File location), not
   // under neat-out/. Routes that read it map a project context to the path.
   policyFilePathFor: (ctx: ProjectContext) => string | undefined
+  // Issue #340 — flips per-project routes from 404 to 503 while a slot is
+  // still extracting.
+  bootstrap?: BuildApiOptions['bootstrap']
 }
 
 // Registers every project-scoped route on `scope`. Called twice from
@@ -156,13 +178,13 @@ function registerRoutes(scope: FastifyInstance, ctx: RouteContext): void {
   // the connection open and writes one frame per bus envelope whose
   // `project` matches.
   scope.get<{ Params: { project?: string } }>('/events', (req, reply) => {
-    const proj = resolveProject(registry, req, reply)
+    const proj = resolveProject(registry, req, reply, ctx.bootstrap)
     if (!proj) return
     handleSse(req, reply, { project: proj.name })
   })
 
   scope.get<{ Params: { project?: string } }>('/health', async (req, reply) => {
-    const proj = resolveProject(registry, req, reply)
+    const proj = resolveProject(registry, req, reply, ctx.bootstrap)
     if (!proj) return
     const uptimeMs = Date.now() - startedAt
     return {
@@ -180,7 +202,7 @@ function registerRoutes(scope: FastifyInstance, ctx: RouteContext): void {
   })
 
   scope.get<{ Params: { project?: string } }>('/graph', async (req, reply) => {
-    const proj = resolveProject(registry, req, reply)
+    const proj = resolveProject(registry, req, reply, ctx.bootstrap)
     if (!proj) return
     return serializeGraph(proj.graph)
   })
@@ -188,7 +210,7 @@ function registerRoutes(scope: FastifyInstance, ctx: RouteContext): void {
   scope.get<{ Params: { project?: string; id: string } }>(
     '/graph/node/:id',
     async (req, reply) => {
-      const proj = resolveProject(registry, req, reply)
+      const proj = resolveProject(registry, req, reply, ctx.bootstrap)
       if (!proj) return
       const { id } = req.params
       if (!proj.graph.hasNode(id)) {
@@ -201,7 +223,7 @@ function registerRoutes(scope: FastifyInstance, ctx: RouteContext): void {
   scope.get<{ Params: { project?: string; id: string } }>(
     '/graph/edges/:id',
     async (req, reply) => {
-      const proj = resolveProject(registry, req, reply)
+      const proj = resolveProject(registry, req, reply, ctx.bootstrap)
       if (!proj) return
       const { id } = req.params
       if (!proj.graph.hasNode(id)) {
@@ -224,7 +246,7 @@ function registerRoutes(scope: FastifyInstance, ctx: RouteContext): void {
     Params: { project?: string; nodeId: string }
     Querystring: { depth?: string }
   }>('/graph/dependencies/:nodeId', async (req, reply) => {
-    const proj = resolveProject(registry, req, reply)
+    const proj = resolveProject(registry, req, reply, ctx.bootstrap)
     if (!proj) return
     const { nodeId } = req.params
     if (!proj.graph.hasNode(nodeId)) {
@@ -246,7 +268,7 @@ function registerRoutes(scope: FastifyInstance, ctx: RouteContext): void {
     Params: { project?: string }
     Querystring: { type?: string; minConfidence?: string; node?: string }
   }>('/graph/divergences', async (req, reply) => {
-    const proj = resolveProject(registry, req, reply)
+    const proj = resolveProject(registry, req, reply, ctx.bootstrap)
     if (!proj) return
     let typeFilter: Set<DivergenceType> | undefined
     if (req.query.type) {
@@ -291,7 +313,7 @@ function registerRoutes(scope: FastifyInstance, ctx: RouteContext): void {
     Params: { project?: string }
     Querystring: { limit?: string }
   }>('/incidents', async (req, reply) => {
-    const proj = resolveProject(registry, req, reply)
+    const proj = resolveProject(registry, req, reply, ctx.bootstrap)
     if (!proj) return
     const epath = errorsPathFor(proj)
     if (!epath) return { count: 0, total: 0, events: [] }
@@ -308,7 +330,7 @@ function registerRoutes(scope: FastifyInstance, ctx: RouteContext): void {
     Params: { project?: string }
     Querystring: { limit?: string; edgeType?: string }
   }>('/stale-events', async (req, reply) => {
-    const proj = resolveProject(registry, req, reply)
+    const proj = resolveProject(registry, req, reply, ctx.bootstrap)
     if (!proj) return
     const spath = staleEventsPathFor(proj)
     if (!spath) return { count: 0, total: 0, events: [] }
@@ -326,7 +348,7 @@ function registerRoutes(scope: FastifyInstance, ctx: RouteContext): void {
   scope.get<{ Params: { project?: string; nodeId: string } }>(
     '/incidents/:nodeId',
     async (req, reply) => {
-      const proj = resolveProject(registry, req, reply)
+      const proj = resolveProject(registry, req, reply, ctx.bootstrap)
       if (!proj) return
       const { nodeId } = req.params
       if (!proj.graph.hasNode(nodeId)) {
@@ -347,7 +369,7 @@ function registerRoutes(scope: FastifyInstance, ctx: RouteContext): void {
     Params: { project?: string; nodeId: string }
     Querystring: { errorId?: string }
   }>('/graph/root-cause/:nodeId', async (req, reply) => {
-    const proj = resolveProject(registry, req, reply)
+    const proj = resolveProject(registry, req, reply, ctx.bootstrap)
     if (!proj) return
     const { nodeId } = req.params
     if (!proj.graph.hasNode(nodeId)) {
@@ -373,7 +395,7 @@ function registerRoutes(scope: FastifyInstance, ctx: RouteContext): void {
     Params: { project?: string; nodeId: string }
     Querystring: { depth?: string }
   }>('/graph/blast-radius/:nodeId', async (req, reply) => {
-    const proj = resolveProject(registry, req, reply)
+    const proj = resolveProject(registry, req, reply, ctx.bootstrap)
     if (!proj) return
     const { nodeId } = req.params
     if (!proj.graph.hasNode(nodeId)) {
@@ -390,7 +412,7 @@ function registerRoutes(scope: FastifyInstance, ctx: RouteContext): void {
     Params: { project?: string }
     Querystring: { q?: string; limit?: string }
   }>('/search', async (req, reply) => {
-    const proj = resolveProject(registry, req, reply)
+    const proj = resolveProject(registry, req, reply, ctx.bootstrap)
     if (!proj) return
     const raw = (req.query.q ?? '').trim()
     if (!raw) return reply.code(400).send({ error: 'query parameter `q` is required' })
@@ -423,7 +445,7 @@ function registerRoutes(scope: FastifyInstance, ctx: RouteContext): void {
   scope.get<{ Params: { project?: string }; Querystring: { against?: string } }>(
     '/graph/diff',
     async (req, reply) => {
-      const proj = resolveProject(registry, req, reply)
+      const proj = resolveProject(registry, req, reply, ctx.bootstrap)
       if (!proj) return
       const against = req.query.against
       if (!against) {
@@ -449,7 +471,7 @@ function registerRoutes(scope: FastifyInstance, ctx: RouteContext): void {
     Params: { project?: string }
     Body: { snapshot?: PersistedGraph }
   }>('/snapshot', async (req, reply) => {
-    const proj = resolveProject(registry, req, reply)
+    const proj = resolveProject(registry, req, reply, ctx.bootstrap)
     if (!proj) return
     const body = req.body
     if (!body || typeof body !== 'object' || !body.snapshot) {
@@ -481,7 +503,7 @@ function registerRoutes(scope: FastifyInstance, ctx: RouteContext): void {
   })
 
   scope.post<{ Params: { project?: string } }>('/graph/scan', async (req, reply) => {
-    const proj = resolveProject(registry, req, reply)
+    const proj = resolveProject(registry, req, reply, ctx.bootstrap)
     if (!proj) return
     if (!proj.scanPath) {
       return reply
@@ -503,7 +525,7 @@ function registerRoutes(scope: FastifyInstance, ctx: RouteContext): void {
   // policy.json; /policies/violations is the persistent log; /policies/check
   // is dry-run evaluation. All dual-mounted via registerRoutes.
   scope.get<{ Params: { project?: string } }>('/policies', async (req, reply) => {
-    const proj = resolveProject(registry, req, reply)
+    const proj = resolveProject(registry, req, reply, ctx.bootstrap)
     if (!proj) return
     const policyPath = ctx.policyFilePathFor(proj)
     if (!policyPath) {
@@ -526,7 +548,7 @@ function registerRoutes(scope: FastifyInstance, ctx: RouteContext): void {
     Params: { project?: string }
     Querystring: { severity?: string; policyId?: string }
   }>('/policies/violations', async (req, reply) => {
-    const proj = resolveProject(registry, req, reply)
+    const proj = resolveProject(registry, req, reply, ctx.bootstrap)
     if (!proj) return
     const log = new PolicyViolationsLog(proj.paths.policyViolationsPath)
     let violations = await log.readAll()
@@ -550,7 +572,7 @@ function registerRoutes(scope: FastifyInstance, ctx: RouteContext): void {
     Params: { project?: string }
     Body: { hypotheticalAction?: unknown }
   }>('/policies/check', async (req, reply) => {
-    const proj = resolveProject(registry, req, reply)
+    const proj = resolveProject(registry, req, reply, ctx.bootstrap)
     if (!proj) return
     const parsed = PoliciesCheckBodySchema.safeParse(req.body ?? {})
     if (!parsed.success) {
@@ -653,6 +675,7 @@ export async function buildApi(opts: BuildApiOptions): Promise<FastifyInstance> 
     errorsPathFor,
     staleEventsPathFor,
     policyFilePathFor,
+    bootstrap: opts.bootstrap,
   }
 
   // Multi-project switcher (ADR-051 #4). Direct passthrough of the
