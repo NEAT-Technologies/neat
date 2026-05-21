@@ -1119,7 +1119,7 @@ export async function runQueryVerb(cmd: string, parsed: ParsedArgs): Promise<num
 // from tests must not start the parser; otherwise vitest sees a stray
 // `process.exit` from `main()` running with no argv.
 const entry = process.argv[1] ?? ''
-if (/[\\/]cli\.(?:cjs|js)$/.test(entry) || entry.endsWith('/cli') || entry.endsWith('/neat')) {
+if (/[\\/]cli\.(?:cjs|js)$/.test(entry) || entry.endsWith('/cli') || entry.endsWith('/neat') || entry.endsWith('/neat.is')) {
   main().catch((err) => {
     console.error(err)
     process.exit(1)
