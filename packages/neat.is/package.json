@@ -17,6 +17,7 @@
   },
   "bin": {
     "neat": "./bin/neat",
+    "neat.is": "./bin/neat",
     "neatd": "./bin/neatd",
     "neat-mcp": "./bin/neat-mcp"
   },
