@@ -3565,7 +3565,7 @@ describe('SDK install — apply-side (ADR-069)', () => {
     }
   })
 
-  it('§1 — generated otel-init imports @opentelemetry/auto-instrumentations-node/register', async () => {
+  it('§1 — generated otel-init constructs the NodeSDK explicitly with getNodeAutoInstrumentations (v0.4.5 / #376)', async () => {
     const fs2 = await import('node:fs/promises')
     const path2 = await import('node:path')
     const { javascriptInstaller } = await import('../../src/installers/javascript.js')
@@ -3576,13 +3576,16 @@ describe('SDK install — apply-side (ADR-069)', () => {
       const plan = await javascriptInstaller.plan(dir)
       await javascriptInstaller.apply(plan)
       const contents = await fs2.readFile(path2.join(dir, 'otel-init.cjs'), 'utf8')
-      expect(contents).toContain('@opentelemetry/auto-instrumentations-node/register')
+      expect(contents).toContain('@opentelemetry/sdk-node')
+      expect(contents).toContain('@opentelemetry/auto-instrumentations-node')
+      expect(contents).toContain('new NodeSDK')
+      expect(contents).toMatch(/getNodeAutoInstrumentations\s*\(\s*\)/)
     } finally {
       await cleanup()
     }
   })
 
-  it('§1 — generated otel-init inlines OTel env defaults before the auto-instrumentation hook runs (v0.4.4 / #369)', async () => {
+  it('§1 — generated otel-init inlines OTel env defaults before the NodeSDK starts (v0.4.4 / #369)', async () => {
     const fs2 = await import('node:fs/promises')
     const path2 = await import('node:path')
     const { javascriptInstaller } = await import('../../src/installers/javascript.js')
@@ -3594,12 +3597,15 @@ describe('SDK install — apply-side (ADR-069)', () => {
       await javascriptInstaller.apply(plan)
       const contents = await fs2.readFile(path2.join(dir, 'otel-init.cjs'), 'utf8')
       // The env defaults are inlined as `process.env.X ||=` before the
-      // auto-instrumentation require runs. dotenv is no longer used.
+      // NodeSDK constructor runs. dotenv is no longer used. v0.4.5 swapped
+      // the auto-register shorthand for explicit construction so non-bundled
+      // instrumentations (Prisma in v0.4.5; more via the v0.5.0 registry)
+      // can compose into the same `instrumentations` array.
       const envIdx = contents.indexOf('process.env.OTEL_SERVICE_NAME ||=')
-      const registerIdx = contents.indexOf('auto-instrumentations-node/register')
+      const startIdx = contents.indexOf('new NodeSDK')
       expect(envIdx).toBeGreaterThan(-1)
-      expect(registerIdx).toBeGreaterThan(-1)
-      expect(envIdx).toBeLessThan(registerIdx)
+      expect(startIdx).toBeGreaterThan(-1)
+      expect(envIdx).toBeLessThan(startIdx)
       expect(contents).not.toContain('dotenv')
     } finally {
       await cleanup()
@@ -3982,9 +3988,11 @@ describe('SDK install — apply-side (ADR-069)', () => {
       await fs2.writeFile(path2.join(dir, 'server.js'), `console.log('hi')\n`)
       const plan = await javascriptInstaller.plan(dir)
       const patch = renderPatch([{ installer: 'javascript', plan }])
-      // The auto-instrumentation hook line from the generated otel-init shows
-      // up in the dry-run output.
-      expect(patch).toContain('@opentelemetry/auto-instrumentations-node/register')
+      // The NodeSDK construction lines from the generated otel-init show up
+      // in the dry-run output (v0.4.5 / #376 — explicit construction replaces
+      // the auto-register shorthand).
+      expect(patch).toContain('@opentelemetry/sdk-node')
+      expect(patch).toContain('new NodeSDK')
       // The injection line shows up too.
       expect(patch).toMatch(/require\(['"]\.\/otel-init/)
     } finally {
@@ -11112,6 +11120,211 @@ describe('v0.4.4 substrate — project-scoped OTLP routing + runtime-kind + hook
       const result = await javascriptInstaller.apply(plan)
       expect(result.outcome).toBe('react-native')
       expect(result.writtenFiles).toEqual([])
+    })
+  })
+
+  // Issue #375 — classification pipeline reorders: lib-only takes precedence
+  // over a stray Vite config or Expo deps when no runtime entry resolves.
+  // Vite/Expo on a library package (no main, no scripts, no src entry) means
+  // the package builds a bundle for someone else to ship, not a runtime NEAT
+  // can instrument.
+  describe('#375 — lib-only classification fires before runtime-kind', () => {
+    it('lib-with-vite-config fixture buckets as lib-only with no writes, no deps, no runtimeKind', async () => {
+      const { javascriptInstaller } = await import('../../src/installers/javascript.js')
+      const plan = await javascriptInstaller.plan(
+        join(__dirname, '../fixtures/lib-with-vite-config'),
+        { project: 'demo' },
+      )
+      expect(plan.libOnly).toBe(true)
+      expect(plan.runtimeKind).toBeUndefined()
+      expect(plan.dependencyEdits).toEqual([])
+      expect(plan.generatedFiles ?? []).toEqual([])
+      const result = await javascriptInstaller.apply(plan)
+      expect(result.outcome).toBe('lib-only')
+      expect(result.writtenFiles).toEqual([])
+    })
+
+    it('vite-baseline fixture continues to bucket as browser-bundle (has src/main.ts entry)', async () => {
+      const { javascriptInstaller } = await import('../../src/installers/javascript.js')
+      const plan = await javascriptInstaller.plan(
+        join(__dirname, '../fixtures/vite-baseline'),
+        { project: 'demo' },
+      )
+      expect(plan.runtimeKind).toBe('browser-bundle')
+      expect(plan.libOnly).toBeFalsy()
+    })
+
+    it('expo-baseline fixture continues to bucket as react-native (has main + index.js)', async () => {
+      const { javascriptInstaller } = await import('../../src/installers/javascript.js')
+      const plan = await javascriptInstaller.plan(
+        join(__dirname, '../fixtures/expo-baseline'),
+        { project: 'demo' },
+      )
+      expect(plan.runtimeKind).toBe('react-native')
+      expect(plan.libOnly).toBeFalsy()
+    })
+  })
+
+  // Issue #376 — explicit `NodeSDK` construction in the generated otel-init
+  // templates so non-bundled instrumentations (Prisma's Rust query engine
+  // bypasses node-pg; the v0.5.0 registry will bring more) compose into a
+  // single `instrumentations` array without templating per-library variants.
+  describe('#376 — explicit NodeSDK construction + Prisma instrumentation', () => {
+    it('OTEL_INIT_CJS uses explicit NodeSDK with an instrumentations array, no auto-register shorthand', async () => {
+      const tpl = await import('../../src/installers/templates.js')
+      expect(tpl.OTEL_INIT_CJS).toContain('new NodeSDK')
+      expect(tpl.OTEL_INIT_CJS).toMatch(/const\s+instrumentations\s*=\s*\[getNodeAutoInstrumentations\(\)\]/)
+      expect(tpl.OTEL_INIT_CJS).toContain('__INSTRUMENTATION_BLOCK__')
+      expect(tpl.OTEL_INIT_CJS).not.toContain('auto-instrumentations-node/register')
+    })
+
+    it('OTEL_INIT_ESM and OTEL_INIT_TS share the explicit-NodeSDK shape', async () => {
+      const tpl = await import('../../src/installers/templates.js')
+      for (const body of [tpl.OTEL_INIT_ESM, tpl.OTEL_INIT_TS]) {
+        expect(body).toContain('new NodeSDK')
+        expect(body).toMatch(/const\s+instrumentations\s*=\s*\[getNodeAutoInstrumentations\(\)\]/)
+        expect(body).toContain('__INSTRUMENTATION_BLOCK__')
+        expect(body).not.toContain('auto-instrumentations-node/register')
+      }
+    })
+
+    it('Next.js variants carry the same instrumentations array + __INSTRUMENTATION_BLOCK__', async () => {
+      const tpl = await import('../../src/installers/templates.js')
+      for (const body of [tpl.NEXT_INSTRUMENTATION_NODE_TS, tpl.NEXT_INSTRUMENTATION_NODE_JS]) {
+        expect(body).toContain('new NodeSDK')
+        expect(body).toMatch(/const\s+instrumentations\s*=\s*\[getNodeAutoInstrumentations\(\)\]/)
+        expect(body).toContain('__INSTRUMENTATION_BLOCK__')
+      }
+    })
+
+    it('renderNodeOtelInit substitutes an empty block when no instrumentations are detected', async () => {
+      const tpl = await import('../../src/installers/templates.js')
+      const out = tpl.renderNodeOtelInit(tpl.OTEL_INIT_CJS, 'svc', 'proj', [])
+      expect(out).not.toContain('__INSTRUMENTATION_BLOCK__')
+      expect(out).not.toContain('@prisma/instrumentation')
+      expect(out).toContain('new NodeSDK')
+    })
+
+    it('renderNodeOtelInit splices each registration into the instrumentations block', async () => {
+      const tpl = await import('../../src/installers/templates.js')
+      const out = tpl.renderNodeOtelInit(tpl.OTEL_INIT_CJS, 'svc', 'proj', [
+        "instrumentations.push(new (require('@prisma/instrumentation').PrismaInstrumentation)())",
+      ])
+      expect(out).not.toContain('__INSTRUMENTATION_BLOCK__')
+      expect(out).toContain('@prisma/instrumentation')
+      expect(out).toContain('PrismaInstrumentation')
+    })
+
+    it('detectNonBundledInstrumentations returns Prisma when @prisma/client is in deps', async () => {
+      const { detectNonBundledInstrumentations } = await import('../../src/installers/javascript.js')
+      const result = detectNonBundledInstrumentations({
+        name: 'svc',
+        dependencies: { '@prisma/client': '^5.0.0' },
+      })
+      expect(result).toHaveLength(1)
+      expect(result[0]!.pkg).toBe('@prisma/instrumentation')
+      expect(result[0]!.version).toMatch(/^\^5/)
+      expect(result[0]!.registration).toContain('PrismaInstrumentation')
+    })
+
+    it('detectNonBundledInstrumentations returns nothing when Prisma is absent', async () => {
+      const { detectNonBundledInstrumentations } = await import('../../src/installers/javascript.js')
+      const result = detectNonBundledInstrumentations({
+        name: 'svc',
+        dependencies: { express: '^4.0.0' },
+      })
+      expect(result).toEqual([])
+    })
+
+    it('plan() with @prisma/client adds @prisma/instrumentation to deps and splices the Prisma block into the generated otel-init (plain Node)', async () => {
+      const fs2 = await import('node:fs/promises')
+      const os2 = await import('node:os')
+      const { javascriptInstaller } = await import('../../src/installers/javascript.js')
+      const root = await fs2.mkdtemp(join(os2.tmpdir(), 'prisma-node-'))
+      await fs2.writeFile(
+        join(root, 'package.json'),
+        JSON.stringify(
+          { name: 'svc', main: 'index.js', dependencies: { '@prisma/client': '^5.0.0' } },
+          null,
+          2,
+        ),
+      )
+      await fs2.writeFile(join(root, 'index.js'), 'console.log("hi")\n')
+      const plan = await javascriptInstaller.plan(root, { project: 'demo' })
+      const depNames = plan.dependencyEdits.map((e) => e.name)
+      expect(depNames).toContain('@prisma/instrumentation')
+      const otelInit = (plan.generatedFiles ?? []).find((g) => /otel-init\./.test(g.file))
+      expect(otelInit).toBeDefined()
+      expect(otelInit!.contents).toContain('PrismaInstrumentation')
+      expect(otelInit!.contents).not.toContain('__INSTRUMENTATION_BLOCK__')
+    })
+
+    it('plan() without Prisma leaves the instrumentations block empty and adds no Prisma dep (plain Node)', async () => {
+      const fs2 = await import('node:fs/promises')
+      const os2 = await import('node:os')
+      const { javascriptInstaller } = await import('../../src/installers/javascript.js')
+      const root = await fs2.mkdtemp(join(os2.tmpdir(), 'no-prisma-'))
+      await fs2.writeFile(
+        join(root, 'package.json'),
+        JSON.stringify({ name: 'svc', main: 'index.js' }, null, 2),
+      )
+      await fs2.writeFile(join(root, 'index.js'), 'console.log("hi")\n')
+      const plan = await javascriptInstaller.plan(root, { project: 'demo' })
+      const depNames = plan.dependencyEdits.map((e) => e.name)
+      expect(depNames).not.toContain('@prisma/instrumentation')
+      const otelInit = (plan.generatedFiles ?? []).find((g) => /otel-init\./.test(g.file))
+      expect(otelInit).toBeDefined()
+      expect(otelInit!.contents).not.toContain('PrismaInstrumentation')
+      expect(otelInit!.contents).not.toContain('__INSTRUMENTATION_BLOCK__')
+    })
+
+    it('Next.js plan with @prisma/client adds the Prisma dep and splices the block into instrumentation.node', async () => {
+      const fs2 = await import('node:fs/promises')
+      const os2 = await import('node:os')
+      const { javascriptInstaller } = await import('../../src/installers/javascript.js')
+      const root = await fs2.mkdtemp(join(os2.tmpdir(), 'prisma-next-'))
+      await fs2.writeFile(
+        join(root, 'package.json'),
+        JSON.stringify(
+          {
+            name: 'next-prisma',
+            scripts: { dev: 'next dev' },
+            dependencies: {
+              next: '^15.0.0',
+              react: '^18.3.0',
+              'react-dom': '^18.3.0',
+              '@prisma/client': '^5.0.0',
+            },
+          },
+          null,
+          2,
+        ),
+      )
+      await fs2.writeFile(join(root, 'next.config.js'), 'module.exports = {}\n')
+      const plan = await javascriptInstaller.plan(root, { project: 'demo' })
+      expect(plan.framework).toBe('next')
+      const depNames = plan.dependencyEdits.map((e) => e.name)
+      expect(depNames).toContain('@prisma/instrumentation')
+      const node = (plan.generatedFiles ?? []).find((g) =>
+        g.file.endsWith('instrumentation.node.ts') || g.file.endsWith('instrumentation.node.js'),
+      )
+      expect(node).toBeDefined()
+      expect(node!.contents).toContain('PrismaInstrumentation')
+      expect(node!.contents).not.toContain('__INSTRUMENTATION_BLOCK__')
+    })
+
+    it('Next.js plan without Prisma leaves the block empty (no Prisma dep, no Prisma registration)', async () => {
+      const { javascriptInstaller } = await import('../../src/installers/javascript.js')
+      const fixture = join(__dirname, '../fixtures/next-baseline')
+      const plan = await javascriptInstaller.plan(fixture, { project: 'demo' })
+      const depNames = plan.dependencyEdits.map((e) => e.name)
+      expect(depNames).not.toContain('@prisma/instrumentation')
+      const node = (plan.generatedFiles ?? []).find((g) =>
+        g.file.endsWith('instrumentation.node.ts') || g.file.endsWith('instrumentation.node.js'),
+      )
+      expect(node).toBeDefined()
+      expect(node!.contents).not.toContain('PrismaInstrumentation')
+      expect(node!.contents).not.toContain('__INSTRUMENTATION_BLOCK__')
     })
   })
 })

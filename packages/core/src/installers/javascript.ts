@@ -74,6 +74,41 @@ const SDK_PACKAGES = [
   { name: '@opentelemetry/auto-instrumentations-node', version: '^0.55.0' },
 ] as const
 
+// Issue #376 — non-bundled instrumentations. The auto-instrumentations-node
+// set covers HTTP, fetch, and the common DB drivers via the wire protocol,
+// but libraries that bypass those wires (Prisma's Rust query engine talks
+// to its own engine binary; LangChain wraps model calls in its own SDK)
+// need their own instrumentation package registered explicitly. The detected
+// entries here compose into the generated otel-init's `instrumentations`
+// array — one `instrumentations.push(...)` line per entry — and join the
+// package.json dep set so the registration line resolves at runtime.
+//
+// v0.4.5 scope is Prisma alone (first library that meaningfully widens
+// NEAT's OBSERVED coverage on real codebases). The function's interface is
+// stable so the v0.5.0 instrumentation registry (ADR-080) can return more
+// entries without revisiting the template.
+interface NonBundledInstrumentation {
+  pkg: string
+  version: string
+  registration: string
+}
+
+export function detectNonBundledInstrumentations(
+  pkg: PackageJsonShape,
+): NonBundledInstrumentation[] {
+  const deps = allDeps(pkg)
+  const out: NonBundledInstrumentation[] = []
+  if ('@prisma/client' in deps) {
+    out.push({
+      pkg: '@prisma/instrumentation',
+      version: '^5.0.0',
+      registration:
+        "instrumentations.push(new (require('@prisma/instrumentation').PrismaInstrumentation)())",
+    })
+  }
+  return out
+}
+
 const OTEL_ENV: EnvEdit = {
   // ADR-069 §4 — endpoint moves into the per-package .env.neat (written
   // by the apply phase). The envEdits surface stays for the dry-run
@@ -535,7 +570,10 @@ async function planNext(
 
   // Dependency edits — `dotenv` is gone repo-wide from v0.4.4 (issue #369),
   // so SDK_PACKAGES has the three OTel packages the apply phase adds and the
-  // Next branch shares the same loop as every other framework.
+  // Next branch shares the same loop as every other framework. Issue #376
+  // adds non-bundled instrumentations (Prisma in v0.4.5) — each detected
+  // entry contributes one dep + one registration line into the generated
+  // instrumentation.node file.
   const existingDeps = { ...(pkg.dependencies ?? {}), ...(pkg.devDependencies ?? {}) }
   const dependencyEdits: DependencyEdit[] = []
   for (const sdk of SDK_PACKAGES) {
@@ -545,6 +583,16 @@ async function planNext(
       kind: 'add',
       name: sdk.name,
       version: sdk.version,
+    })
+  }
+  const nonBundled = detectNonBundledInstrumentations(pkg)
+  for (const inst of nonBundled) {
+    if (inst.pkg in existingDeps) continue
+    dependencyEdits.push({
+      file: manifestPath,
+      kind: 'add',
+      name: inst.pkg,
+      version: inst.version,
     })
   }
 
@@ -557,6 +605,7 @@ async function planNext(
   // with both values verbatim.
   const svcName = serviceNodeName(pkg, serviceDir)
   const projectName = projectToken(pkg, serviceDir, project)
+  const registrations = nonBundled.map((i) => i.registration)
   const generatedFiles: GeneratedFile[] = []
   if (!(await exists(instrumentationFile))) {
     generatedFiles.push({
@@ -572,6 +621,7 @@ async function planNext(
         useTs ? NEXT_INSTRUMENTATION_NODE_TS : NEXT_INSTRUMENTATION_NODE_JS,
         svcName,
         projectName,
+        registrations,
       ),
       skipIfExists: true,
     })
@@ -1025,6 +1075,55 @@ async function planAstro(
   }
 }
 
+type FrameworkDispatch = () => Promise<InstallPlan>
+
+// ADR-073 §1 + ADR-074 §3 — framework signal lookup. Returns a thunk that
+// invokes the framework-specific planner when a match lands, or null when
+// none do. Detection precedence is Next → Remix → SvelteKit → Nuxt → Astro;
+// the chain bails on the first match. Pulled out of `plan()` so issue
+// #375's lib-only check can see the framework signal upfront — a package
+// with no framework hook AND no Node entry buckets as lib-only regardless
+// of stray Vite config or Expo deps.
+async function findFrameworkDispatch(
+  serviceDir: string,
+  pkg: PackageJsonShape,
+  manifestPath: string,
+  project: string | undefined,
+): Promise<FrameworkDispatch | null> {
+  if (hasNextDependency(pkg)) {
+    const nextConfig = await findNextConfig(serviceDir)
+    if (nextConfig) {
+      return () => planNext(serviceDir, pkg, manifestPath, nextConfig, project)
+    }
+  }
+  if (hasRemixDependency(pkg)) {
+    const remixEntry = await findRemixEntry(serviceDir)
+    if (remixEntry) {
+      return () => planRemix(serviceDir, pkg, manifestPath, remixEntry, project)
+    }
+  }
+  if (hasSvelteKitDependency(pkg)) {
+    const hooks = await findSvelteKitHooks(serviceDir)
+    const config = await findSvelteKitConfig(serviceDir)
+    if (hooks || config) {
+      return () => planSvelteKit(serviceDir, pkg, manifestPath, hooks, project)
+    }
+  }
+  if (hasNuxtDependency(pkg)) {
+    const nuxtConfig = await findNuxtConfig(serviceDir)
+    if (nuxtConfig) {
+      return () => planNuxt(serviceDir, pkg, manifestPath, project)
+    }
+  }
+  if (hasAstroDependency(pkg)) {
+    const astroConfig = await findAstroConfig(serviceDir)
+    if (astroConfig) {
+      return () => planAstro(serviceDir, pkg, manifestPath, project)
+    }
+  }
+  return null
+}
+
 async function plan(serviceDir: string, opts?: PlanOptions): Promise<InstallPlan> {
   const pkg = await readPackageJson(serviceDir)
   const manifestPath = path.join(serviceDir, 'package.json')
@@ -1039,56 +1138,49 @@ async function plan(serviceDir: string, opts?: PlanOptions): Promise<InstallPlan
   }
   if (!pkg) return empty
 
-  // ADR-073 §1 + ADR-074 §3 — framework dispatch runs before entry
-  // resolution. When a meta-framework owns the boot path, `pkg.main` isn't
-  // load-bearing and the require/import injection would be ignored. Each
-  // framework-flavored plan emits the framework's canonical hook surface
-  // instead. Detection precedence is Next → Remix → SvelteKit → Nuxt →
-  // Astro → vanilla Node; the chain bails on the first match.
-  if (hasNextDependency(pkg)) {
-    const nextConfig = await findNextConfig(serviceDir)
-    if (nextConfig) {
-      return planNext(serviceDir, pkg, manifestPath, nextConfig, project)
-    }
-  }
-  if (hasRemixDependency(pkg)) {
-    const remixEntry = await findRemixEntry(serviceDir)
-    if (remixEntry) {
-      return planRemix(serviceDir, pkg, manifestPath, remixEntry, project)
-    }
-  }
-  if (hasSvelteKitDependency(pkg)) {
-    const hooks = await findSvelteKitHooks(serviceDir)
-    const config = await findSvelteKitConfig(serviceDir)
-    if (hooks || config) {
-      return planSvelteKit(serviceDir, pkg, manifestPath, hooks, project)
-    }
-  }
-  if (hasNuxtDependency(pkg)) {
-    const nuxtConfig = await findNuxtConfig(serviceDir)
-    if (nuxtConfig) {
-      return planNuxt(serviceDir, pkg, manifestPath, project)
-    }
-  }
-  if (hasAstroDependency(pkg)) {
-    const astroConfig = await findAstroConfig(serviceDir)
-    if (astroConfig) {
-      return planAstro(serviceDir, pkg, manifestPath, project)
+  // Issue #375 — classification pipeline order: lib-only → framework →
+  // runtime-kind → emit. A package with no framework hook AND no resolvable
+  // Node entry is lib-only regardless of stray Vite config or Expo deps. The
+  // runtime-kind dispatch only fires for non-framework packages that
+  // actually have an entry to instrument; without this ordering, a UI library
+  // that ships a `vite.config.ts` for its build pipeline would bucket as
+  // browser-bundle and surface in the operator summary as if it were a real
+  // SPA the installer was choosing to skip.
+  const frameworkDispatch = await findFrameworkDispatch(
+    serviceDir,
+    pkg,
+    manifestPath,
+    project,
+  )
+
+  // Resolve the Node entry up front so the lib-only check can read both
+  // signals together. Skipped on the framework branch — frameworks own their
+  // boot path and never need a `pkg.main` injection (the chain returns
+  // before this line runs).
+  let entryFile: string | null = null
+  if (!frameworkDispatch) {
+    entryFile = await resolveEntry(serviceDir, pkg)
+    if (!entryFile) {
+      return { ...empty, libOnly: true }
     }
   }
 
-  // Issue #370 — runtime-kind detection sits between the framework dispatch
-  // chain and vanilla Node template emission. Browser bundles (Vite) and
-  // React Native / Expo packages bucket here so the apply phase skips every
-  // write and surfaces the package in the summary instead of injecting a
-  // Node SDK hook into code that can't run it.
+  if (frameworkDispatch) {
+    return frameworkDispatch()
+  }
+
+  // Issue #370 — runtime-kind detection sits between the lib-only check and
+  // vanilla Node template emission. Browser bundles (Vite) and React Native
+  // / Expo packages bucket here so the apply phase skips every write and
+  // surfaces the package in the summary instead of injecting a Node SDK hook
+  // into code that can't run it.
   const runtimeKind = await detectRuntimeKind(serviceDir, pkg)
   if (runtimeKind !== 'node') {
     return { ...empty, runtimeKind }
   }
 
-  // ADR-069 §2 — entry resolution before anything else. No entry → lib-only.
-  const entryFile = await resolveEntry(serviceDir, pkg)
+  // entryFile resolved above on the non-framework branch; the null path
+  // already returned lib-only.
   if (!entryFile) {
     return { ...empty, libOnly: true }
   }
@@ -1097,6 +1189,10 @@ async function plan(serviceDir: string, opts?: PlanOptions): Promise<InstallPlan
   const envNeatFile = path.join(serviceDir, '.env.neat')
 
   // ── Dependency edits (four-deps invariant; ADR-069 §5). ────────────────
+  // Issue #376 — non-bundled instrumentations append additional deps when
+  // the host package declares libraries whose runtime traffic bypasses the
+  // auto-instrumentation set (Prisma's Rust query engine for v0.4.5; the
+  // v0.5.0 registry feeds the same loop with more entries).
   const existingDeps = { ...(pkg.dependencies ?? {}), ...(pkg.devDependencies ?? {}) }
   const dependencyEdits: DependencyEdit[] = []
   for (const sdk of SDK_PACKAGES) {
@@ -1106,6 +1202,16 @@ async function plan(serviceDir: string, opts?: PlanOptions): Promise<InstallPlan
       kind: 'add',
       name: sdk.name,
       version: sdk.version,
+    })
+  }
+  const nonBundled = detectNonBundledInstrumentations(pkg)
+  for (const inst of nonBundled) {
+    if (inst.pkg in existingDeps) continue
+    dependencyEdits.push({
+      file: manifestPath,
+      kind: 'add',
+      name: inst.pkg,
+      version: inst.version,
     })
   }
 
@@ -1138,13 +1244,23 @@ async function plan(serviceDir: string, opts?: PlanOptions): Promise<InstallPlan
   // ServiceNode id) and `__PROJECT__` (the URL routing key) placeholders we
   // substitute here. The .env.neat shape lands with the same pair so an
   // operator can grep for both fields in one place.
+  // v0.4.5 — `__INSTRUMENTATION_BLOCK__` substitutes to the registration
+  // snippets for any non-bundled instrumentations detected above (Prisma
+  // for v0.4.5; the v0.5.0 registry will feed more entries through the same
+  // path). Empty list collapses cleanly to nothing.
   const svcName = serviceNodeName(pkg, serviceDir)
   const projectName = projectToken(pkg, serviceDir, project)
+  const registrations = nonBundled.map((i) => i.registration)
   const generatedFiles: GeneratedFile[] = []
   if (!(await exists(otelInitFile))) {
     generatedFiles.push({
       file: otelInitFile,
-      contents: renderNodeOtelInit(otelInitContents(flavor), svcName, projectName),
+      contents: renderNodeOtelInit(
+        otelInitContents(flavor),
+        svcName,
+        projectName,
+        registrations,
+      ),
       skipIfExists: true,
     })
   }
