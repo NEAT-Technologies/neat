@@ -510,6 +510,156 @@ describe('Lifecycle contract — FrontierNode promotion preserves provenance (AD
 })
 
 // ──────────────────────────────────────────────────────────────────────────
+// File-awareness contract — OBSERVED gets file origin from span `code.*`
+// (ADR-087 §2/§3, docs/contracts/file-awareness.md)
+// ──────────────────────────────────────────────────────────────────────────
+describe('File-awareness contract — OBSERVED evidence from span code.* (ADR-087)', () => {
+  function callerCalleeGraph(): NeatGraph {
+    const g: NeatGraph = new MultiDirectedGraph<GraphNode, GraphEdge>({ allowSelfLoops: false })
+    g.addNode('service:caller', {
+      id: 'service:caller',
+      type: NodeType.ServiceNode,
+      name: 'caller',
+      language: 'javascript',
+    })
+    g.addNode('service:callee', {
+      id: 'service:callee',
+      type: NodeType.ServiceNode,
+      name: 'callee',
+      language: 'javascript',
+    })
+    return g
+  }
+
+  function clientSpan(overrides: Record<string, unknown> = {}) {
+    return {
+      service: 'caller',
+      traceId: 't1',
+      spanId: 's1',
+      name: 'GET /things',
+      kind: 3,
+      statusCode: 0,
+      startTimeUnixNano: '0',
+      endTimeUnixNano: '0',
+      durationNanos: 0n,
+      env: 'unknown',
+      attributes: {
+        'server.address': 'callee',
+        'http.method': 'GET',
+      } as Record<string, unknown>,
+      ...overrides,
+    }
+  }
+
+  it('span carrying code.* lands file + line on the OBSERVED edge evidence', async () => {
+    const { handleSpan } = await import('../../src/ingest.js')
+    const { observedEdgeId } = await import('@neat.is/types')
+    const g = callerCalleeGraph()
+    await handleSpan(
+      { graph: g, errorsPath: '/dev/null' },
+      clientSpan({
+        attributes: {
+          'server.address': 'callee',
+          'http.method': 'GET',
+          'code.filepath': 'src/checkout.ts',
+          'code.lineno': 42,
+          'code.function': 'placeOrder',
+        },
+      }) as never,
+    )
+    const id = observedEdgeId('service:caller', 'service:callee', EdgeType.CALLS)
+    const edge = g.getEdgeAttributes(id) as GraphEdge
+    expect(edge.provenance).toBe(Provenance.OBSERVED)
+    expect(edge.evidence?.file).toBe('src/checkout.ts')
+    expect(edge.evidence?.line).toBe(42)
+  })
+
+  it('span without code.* leaves the OBSERVED edge with no evidence (no fabrication)', async () => {
+    const { handleSpan } = await import('../../src/ingest.js')
+    const { observedEdgeId } = await import('@neat.is/types')
+    const g = callerCalleeGraph()
+    await handleSpan({ graph: g, errorsPath: '/dev/null' }, clientSpan() as never)
+    const id = observedEdgeId('service:caller', 'service:callee', EdgeType.CALLS)
+    const edge = g.getEdgeAttributes(id) as GraphEdge
+    expect(edge.provenance).toBe(Provenance.OBSERVED)
+    expect(edge.evidence).toBeUndefined()
+  })
+
+  it('code.filepath without code.lineno records the file but never a synthesized line', async () => {
+    const { handleSpan } = await import('../../src/ingest.js')
+    const { observedEdgeId } = await import('@neat.is/types')
+    const g = callerCalleeGraph()
+    await handleSpan(
+      { graph: g, errorsPath: '/dev/null' },
+      clientSpan({
+        attributes: {
+          'server.address': 'callee',
+          'http.method': 'GET',
+          'code.filepath': 'src/checkout.ts',
+        },
+      }) as never,
+    )
+    const id = observedEdgeId('service:caller', 'service:callee', EdgeType.CALLS)
+    const edge = g.getEdgeAttributes(id) as GraphEdge
+    expect(edge.evidence?.file).toBe('src/checkout.ts')
+    expect(edge.evidence?.line).toBeUndefined()
+  })
+
+  it('evidence is additive — signal, callCount, lastObserved, provenance unchanged across a code.* span', async () => {
+    const { handleSpan } = await import('../../src/ingest.js')
+    const { observedEdgeId } = await import('@neat.is/types')
+    const g = callerCalleeGraph()
+    // First a plain span (no code.*), then one carrying code.* — the second
+    // adds evidence without disturbing the running signal block.
+    await handleSpan({ graph: g, errorsPath: '/dev/null' }, clientSpan() as never)
+    await handleSpan(
+      { graph: g, errorsPath: '/dev/null' },
+      clientSpan({
+        spanId: 's2',
+        attributes: {
+          'server.address': 'callee',
+          'http.method': 'GET',
+          'code.filepath': 'src/checkout.ts',
+          'code.lineno': 42,
+        },
+      }) as never,
+    )
+    const id = observedEdgeId('service:caller', 'service:callee', EdgeType.CALLS)
+    const edge = g.getEdgeAttributes(id) as GraphEdge
+    expect(edge.provenance).toBe(Provenance.OBSERVED)
+    expect(edge.callCount).toBe(2)
+    expect(edge.signal?.spanCount).toBe(2)
+    expect(edge.evidence?.file).toBe('src/checkout.ts')
+    expect(edge.evidence?.line).toBe(42)
+  })
+
+  it('a later span without code.* keeps prior real evidence rather than erasing it', async () => {
+    const { handleSpan } = await import('../../src/ingest.js')
+    const { observedEdgeId } = await import('@neat.is/types')
+    const g = callerCalleeGraph()
+    await handleSpan(
+      { graph: g, errorsPath: '/dev/null' },
+      clientSpan({
+        attributes: {
+          'server.address': 'callee',
+          'http.method': 'GET',
+          'code.filepath': 'src/checkout.ts',
+          'code.lineno': 42,
+        },
+      }) as never,
+    )
+    await handleSpan(
+      { graph: g, errorsPath: '/dev/null' },
+      clientSpan({ spanId: 's2' }) as never,
+    )
+    const id = observedEdgeId('service:caller', 'service:callee', EdgeType.CALLS)
+    const edge = g.getEdgeAttributes(id) as GraphEdge
+    expect(edge.evidence?.file).toBe('src/checkout.ts')
+    expect(edge.evidence?.line).toBe(42)
+  })
+})
+
+// ──────────────────────────────────────────────────────────────────────────
 // Static-extraction contract — producer interface, evidence, idempotency (ADR-032)
 // ──────────────────────────────────────────────────────────────────────────
 describe('Static-extraction contract (ADR-032)', () => {

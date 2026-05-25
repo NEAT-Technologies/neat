@@ -2,6 +2,7 @@ import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import type {
   DatabaseNode,
+  EdgeEvidence,
   ErrorEvent,
   FrontierNode,
   GraphEdge,
@@ -154,6 +155,25 @@ function hostFromUrl(u: string | undefined): string | undefined {
   } catch {
     return undefined
   }
+}
+
+// Call-site evidence from the `code.*` attributes NEAT's injected
+// instrumentation attaches on CLIENT/PRODUCER spans (ADR-087, file-awareness
+// §2/§3). `code.filepath` is the user-code frame the call originated from;
+// `code.lineno` its line. Returns undefined when `code.filepath` is absent —
+// SERVER spans and any span without the call-site processor carry no origin,
+// and we never synthesize one (file-awareness §3). `line` is dropped, not
+// faked, when `code.lineno` isn't a usable non-negative integer; the file
+// still stands on its own as honest partial evidence.
+function evidenceFromSpan(span: ParsedSpan): EdgeEvidence | undefined {
+  const file = pickAttr(span, 'code.filepath')
+  if (!file) return undefined
+  const rawLine = span.attributes['code.lineno']
+  const line =
+    typeof rawLine === 'number' && Number.isInteger(rawLine) && rawLine >= 0
+      ? rawLine
+      : undefined
+  return { file, ...(line !== undefined ? { line } : {}) }
 }
 
 // OTel HTTP/db semconv has gone through several names for "the host on the
@@ -370,6 +390,12 @@ function upsertObservedEdge(
   target: string,
   ts: string,
   isError = false,
+  // Call-site evidence parsed from the span's `code.*` attributes, when the
+  // span carried them (ADR-087, file-awareness §2). Additive — it never
+  // touches signal / callCount / lastObserved / provenance. Undefined when the
+  // span had no call-site origin; in that case existing evidence is left as-is
+  // and no edge gains a synthesized file/line (file-awareness §3).
+  evidence?: EdgeEvidence,
 ): UpsertResult | null {
   if (!graph.hasNode(source) || !graph.hasNode(target)) return null
 
@@ -385,7 +411,9 @@ function upsertObservedEdge(
     }
     // ADR-066 §2 — confidence grades from the signal block. PROV_RANK stays;
     // the grade reflects volume + recency + error ratio within the OBSERVED
-    // tier.
+    // tier. `...existing` carries any prior evidence forward; a fresh span with
+    // its own `code.*` refreshes it to the latest call site, while a span
+    // without `code.*` leaves the prior (real) evidence untouched.
     const updated: GraphEdge = {
       ...existing,
       provenance: Provenance.OBSERVED,
@@ -393,6 +421,7 @@ function upsertObservedEdge(
       callCount: newSpanCount,
       signal: newSignal,
       confidence: confidenceForObservedSignal(newSignal),
+      ...(evidence ? { evidence } : {}),
     }
     graph.replaceEdgeAttributes(id, updated)
     return { edge: updated, created: false }
@@ -413,6 +442,7 @@ function upsertObservedEdge(
     lastObserved: ts,
     callCount: 1,
     signal,
+    ...(evidence ? { evidence } : {}),
   }
   graph.addEdgeWithKey(id, source, target, edge)
   return { edge, created: true }
@@ -575,6 +605,14 @@ export async function handleSpan(ctx: IngestContext, span: ParsedSpan): Promise<
   // when the span carries an env signal.
   const sourceId = ensureServiceNode(ctx.graph, span.service, env)
   const isError = span.statusCode === 2
+  // Call-site origin from the span's `code.*` attributes (ADR-087). Present on
+  // CLIENT/PRODUCER spans the injected instrumentation tagged; absent on SERVER
+  // spans and anything without the call-site processor. The edges below that
+  // represent *this* span's outbound call (DB CONNECTS_TO, address-resolved
+  // CALLS, frontier CALLS) take it as additive evidence. The parent-span
+  // fallback edge does not — there the current span is the server side, so its
+  // origin isn't the call site of that parent → current edge (file-awareness §2).
+  const evidence = evidenceFromSpan(span)
   // Stash this span in the parent-span cache so any later child whose address
   // resolution misses can still resolve the cross-service edge via parentSpanId.
   cacheSpanService(span, nowMs)
@@ -596,6 +634,7 @@ export async function handleSpan(ctx: IngestContext, span: ParsedSpan): Promise<
         targetId,
         ts,
         isError,
+        evidence,
       )
       if (result) affectedNode = targetId
     }
@@ -622,6 +661,7 @@ export async function handleSpan(ctx: IngestContext, span: ParsedSpan): Promise<
           targetId,
           ts,
           isError,
+          evidence,
         )
         affectedNode = targetId
         resolvedViaAddress = true
@@ -634,6 +674,7 @@ export async function handleSpan(ctx: IngestContext, span: ParsedSpan): Promise<
           frontierNodeId,
           ts,
           isError,
+          evidence,
         )
         affectedNode = frontierNodeId
         resolvedViaAddress = true
