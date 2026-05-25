@@ -1,4 +1,4 @@
-import type { GraphEdge, InfraNode } from '@neat.is/types'
+import type { EdgeEvidence, GraphEdge, InfraNode } from '@neat.is/types'
 import {
   EdgeType,
   NodeType,
@@ -74,7 +74,20 @@ async function addExternalEndpointEdges(
     }
     if (endpoints.length === 0) continue
 
-    const seenEdges = new Set<string>()
+    // Group every endpoint by the edge it implies, keeping each distinct
+    // (file, line) call site instead of the first-write-wins collapse that
+    // used to drop the rest (ADR-087 / #396). The same target called from
+    // several files produces several endpoints; they all belong to one edge
+    // and each contributes a call site. `rep` is the first site seen, which
+    // keeps the representative `evidence.file`/`line` byte-identical to the
+    // pre-#396 behaviour (retire.ts keys ghost-edge cleanup on it).
+    interface EdgeAgg {
+      ep: ExternalEndpoint
+      edgeType: (typeof EdgeType)[keyof typeof EdgeType]
+      sites: EdgeEvidence[]
+      siteKeys: Set<string>
+    }
+    const byEdge = new Map<string, EdgeAgg>()
     for (const ep of endpoints) {
       if (!graph.hasNode(ep.infraId)) {
         const node: InfraNode = {
@@ -93,31 +106,48 @@ async function addExternalEndpointEdges(
 
       const edgeType = edgeTypeFromEndpoint(ep)
       const edgeId = makeEdgeId(service.node.id, ep.infraId, edgeType)
-      if (seenEdges.has(edgeId)) continue
-      seenEdges.add(edgeId)
-      const confidence = confidenceForExtracted(ep.confidenceKind)
+      let agg = byEdge.get(edgeId)
+      if (!agg) {
+        agg = { ep, edgeType, sites: [], siteKeys: new Set() }
+        byEdge.set(edgeId, agg)
+      }
+      const key = `${ep.evidence.file}|${ep.evidence.line ?? ''}`
+      if (!agg.siteKeys.has(key)) {
+        agg.siteKeys.add(key)
+        agg.sites.push(ep.evidence)
+      }
+    }
+
+    for (const [edgeId, agg] of byEdge) {
+      const confidence = confidenceForExtracted(agg.ep.confidenceKind)
+      const rep = agg.sites[0]!
       // Precision floor (ADR-066 §3). Sub-threshold candidates are computed
       // but never added to the graph; the banner reports the drop count.
       if (!passesExtractedFloor(confidence)) {
         noteExtractedDropped({
           source: service.node.id,
-          target: ep.infraId,
-          type: edgeType,
+          target: agg.ep.infraId,
+          type: agg.edgeType,
           confidence,
-          confidenceKind: ep.confidenceKind,
-          evidence: ep.evidence,
+          confidenceKind: agg.ep.confidenceKind,
+          evidence: rep,
         })
         continue
       }
       if (!graph.hasEdge(edgeId)) {
+        // `sites` only when more than one origin backs the edge — a
+        // single-site edge stays exactly as it was before #396 (no `sites`
+        // field), so existing snapshots and #395's writes are unaffected.
+        const evidence: EdgeEvidence =
+          agg.sites.length > 1 ? { ...rep, sites: agg.sites } : rep
         const edge: GraphEdge = {
           id: edgeId,
           source: service.node.id,
-          target: ep.infraId,
-          type: edgeType,
+          target: agg.ep.infraId,
+          type: agg.edgeType,
           provenance: Provenance.EXTRACTED,
           confidence,
-          evidence: ep.evidence,
+          evidence,
         }
         graph.addEdgeWithKey(edgeId, edge.source, edge.target, edge)
         edgesAdded++

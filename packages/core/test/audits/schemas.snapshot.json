@@ -101,6 +101,26 @@
                                 ]
                               }
                             },
+                            "sites": {
+                              "_optional": {
+                                "_array": {
+                                  "_object": {
+                                    "file": "_string",
+                                    "line": {
+                                      "_optional": {
+                                        "_number": [
+                                          "int",
+                                          "min"
+                                        ]
+                                      }
+                                    },
+                                    "snippet": {
+                                      "_optional": "_string"
+                                    }
+                                  }
+                                }
+                              }
+                            },
                             "snippet": {
                               "_optional": "_string"
                             }
@@ -219,6 +239,26 @@
                                   "int",
                                   "min"
                                 ]
+                              }
+                            },
+                            "sites": {
+                              "_optional": {
+                                "_array": {
+                                  "_object": {
+                                    "file": "_string",
+                                    "line": {
+                                      "_optional": {
+                                        "_number": [
+                                          "int",
+                                          "min"
+                                        ]
+                                      }
+                                    },
+                                    "snippet": {
+                                      "_optional": "_string"
+                                    }
+                                  }
+                                }
                               }
                             },
                             "snippet": {
@@ -375,6 +415,26 @@
                                 ]
                               }
                             },
+                            "sites": {
+                              "_optional": {
+                                "_array": {
+                                  "_object": {
+                                    "file": "_string",
+                                    "line": {
+                                      "_optional": {
+                                        "_number": [
+                                          "int",
+                                          "min"
+                                        ]
+                                      }
+                                    },
+                                    "snippet": {
+                                      "_optional": "_string"
+                                    }
+                                  }
+                                }
+                              }
+                            },
                             "snippet": {
                               "_optional": "_string"
                             }
@@ -526,6 +586,26 @@
                           ]
                         }
                       },
+                      "sites": {
+                        "_optional": {
+                          "_array": {
+                            "_object": {
+                              "file": "_string",
+                              "line": {
+                                "_optional": {
+                                  "_number": [
+                                    "int",
+                                    "min"
+                                  ]
+                                }
+                              },
+                              "snippet": {
+                                "_optional": "_string"
+                              }
+                            }
+                          }
+                        }
+                      },
                       "snippet": {
                         "_optional": "_string"
                       }
@@ -644,6 +724,26 @@
                             "int",
                             "min"
                           ]
+                        }
+                      },
+                      "sites": {
+                        "_optional": {
+                          "_array": {
+                            "_object": {
+                              "file": "_string",
+                              "line": {
+                                "_optional": {
+                                  "_number": [
+                                    "int",
+                                    "min"
+                                  ]
+                                }
+                              },
+                              "snippet": {
+                                "_optional": "_string"
+                              }
+                            }
+                          }
                         }
                       },
                       "snippet": {
@@ -798,6 +898,26 @@
                             "int",
                             "min"
                           ]
+                        }
+                      },
+                      "sites": {
+                        "_optional": {
+                          "_array": {
+                            "_object": {
+                              "file": "_string",
+                              "line": {
+                                "_optional": {
+                                  "_number": [
+                                    "int",
+                                    "min"
+                                  ]
+                                }
+                              },
+                              "snippet": {
+                                "_optional": "_string"
+                              }
+                            }
+                          }
                         }
                       },
                       "snippet": {
@@ -975,6 +1095,26 @@
                   "int",
                   "min"
                 ]
+              }
+            },
+            "sites": {
+              "_optional": {
+                "_array": {
+                  "_object": {
+                    "file": "_string",
+                    "line": {
+                      "_optional": {
+                        "_number": [
+                          "int",
+                          "min"
+                        ]
+                      }
+                    },
+                    "snippet": {
+                      "_optional": "_string"
+                    }
+                  }
+                }
               }
             },
             "snippet": {

@@ -5733,6 +5733,182 @@ describe('Queued contracts (v0.2.1 leftovers — #141, #142, #145)', () => {
   it.todo('Drop unused graphology-traversal/-shortest-path deps (issue #145)')
 })
 
+// ──────────────────────────────────────────────────────────────────────────
+// ADR-087 / #396 — EXTRACTED file-grain. The CALLS-family producers used to
+// keep the first call site per service edge and drop the rest. They now
+// preserve every distinct (file, line) origin in `evidence.sites`, additively:
+// `evidence.file`/`line`/`snippet` stay as the representative site so
+// retire.ts and #395's single-evidence writes are unaffected, and `sites` is
+// attached only when more than one origin backs the edge.
+// ──────────────────────────────────────────────────────────────────────────
+describe('EXTRACTED file-grain — multi-call-site retention (ADR-087 / #396)', () => {
+  it('keeps every call site when one target is reached from several files', async () => {
+    const { extractFromDirectory } = await import('../../src/extract.js')
+    const fs2 = await import('node:fs/promises')
+    const os2 = await import('node:os')
+    const path2 = await import('node:path')
+
+    const root = await fs2.mkdtemp(path2.join(os2.tmpdir(), 'adr-087-grain-'))
+    try {
+      await fs2.writeFile(
+        path2.join(root, 'package.json'),
+        JSON.stringify({ name: 'multi-site-svc', version: '1.0.0' }),
+      )
+      // Two files publish to the same Kafka topic. Kafka is graded
+      // verified-call-site (0.85), so the edge clears the default precision
+      // floor without lowering it.
+      const send = `await producer.send({ topic: 'orders', messages: [{ value: 'x' }] })`
+      await fs2.writeFile(path2.join(root, 'publish-a.js'), `async function a(producer) { ${send} }\nmodule.exports = { a }\n`)
+      await fs2.writeFile(path2.join(root, 'publish-b.js'), `async function b(producer) { ${send} }\nmodule.exports = { b }\n`)
+
+      const g: NeatGraph = new MultiDirectedGraph<GraphNode, GraphEdge>({ allowSelfLoops: false })
+      await extractFromDirectory(g, root)
+
+      expect(g.hasNode('infra:kafka-topic:orders')).toBe(true)
+      const publishEdges: GraphEdge[] = []
+      g.forEachEdge((_id, attrs) => {
+        const e = attrs as GraphEdge
+        if (e.type === EdgeType.PUBLISHES_TO && e.target === 'infra:kafka-topic:orders') {
+          publishEdges.push(e)
+        }
+      })
+      // One edge — both files collapse to the single service→topic edge.
+      expect(publishEdges).toHaveLength(1)
+      const edge = publishEdges[0]!
+
+      // Every distinct call site is retained, not just the first.
+      const sites = edge.evidence?.sites
+      expect(sites).toBeDefined()
+      const siteFiles = sites!.map((s) => s.file).sort()
+      expect(siteFiles).toEqual(['publish-a.js', 'publish-b.js'])
+
+      // The representative evidence stays a real, single call site (the first),
+      // so consumers that read only `evidence.file` — including retire.ts —
+      // keep working.
+      expect(edge.evidence?.file).toBe(sites![0]!.file)
+      expect(GraphEdgeSchema.parse(edge)).toBeTruthy()
+    } finally {
+      await fs2.rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('leaves `sites` unset when a single call site backs the edge (back-compat)', async () => {
+    const { extractFromDirectory } = await import('../../src/extract.js')
+    const fs2 = await import('node:fs/promises')
+    const os2 = await import('node:os')
+    const path2 = await import('node:path')
+
+    const root = await fs2.mkdtemp(path2.join(os2.tmpdir(), 'adr-087-single-'))
+    try {
+      await fs2.writeFile(
+        path2.join(root, 'package.json'),
+        JSON.stringify({ name: 'single-site-svc', version: '1.0.0' }),
+      )
+      await fs2.writeFile(
+        path2.join(root, 'publish.js'),
+        `async function a(producer) { await producer.send({ topic: 'orders', messages: [] }) }\nmodule.exports = { a }\n`,
+      )
+
+      const g: NeatGraph = new MultiDirectedGraph<GraphNode, GraphEdge>({ allowSelfLoops: false })
+      await extractFromDirectory(g, root)
+
+      let edge: GraphEdge | undefined
+      g.forEachEdge((_id, attrs) => {
+        const e = attrs as GraphEdge
+        if (e.type === EdgeType.PUBLISHES_TO && e.target === 'infra:kafka-topic:orders') edge = e
+      })
+      expect(edge).toBeDefined()
+      expect(edge!.evidence?.file).toBe('publish.js')
+      // No multi-site array on a single-origin edge — byte-identical to pre-#396.
+      expect(edge!.evidence?.sites).toBeUndefined()
+    } finally {
+      await fs2.rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('retireEdgesByFile drops a multi-site edge when any backing file changes', async () => {
+    const { retireEdgesByFile } = await import('../../src/extract/retire.js')
+    const g: NeatGraph = new MultiDirectedGraph<GraphNode, GraphEdge>({ allowSelfLoops: false })
+    g.addNode('service:a', { id: 'service:a', type: NodeType.ServiceNode, name: 'a', language: 'javascript' })
+    g.addNode('infra:kafka-topic:orders', { id: 'infra:kafka-topic:orders', type: NodeType.InfraNode, name: 'orders', kind: 'kafka-topic', provider: 'self' })
+
+    const multiId = 'PUBLISHES_TO:service:a->infra:kafka-topic:orders'
+    g.addEdgeWithKey(multiId, 'service:a', 'infra:kafka-topic:orders', {
+      id: multiId,
+      source: 'service:a',
+      target: 'infra:kafka-topic:orders',
+      type: EdgeType.PUBLISHES_TO,
+      provenance: Provenance.EXTRACTED,
+      evidence: {
+        file: 'publish-a.js',
+        line: 1,
+        sites: [
+          { file: 'publish-a.js', line: 1 },
+          { file: 'publish-b.js', line: 1 },
+        ],
+      },
+    })
+
+    // The changed file is the second site, not the representative `evidence.file`.
+    // The edge still retires so the producer re-derives its surviving sites.
+    const dropped = retireEdgesByFile(g, 'publish-b.js')
+    expect(dropped).toBe(1)
+    expect(g.hasEdge(multiId)).toBe(false)
+  })
+
+  it('retireExtractedEdgesByMissingFile keeps a multi-site edge while one site survives', async () => {
+    const { retireExtractedEdgesByMissingFile } = await import('../../src/extract/retire.js')
+    const fs2 = await import('node:fs/promises')
+    const os2 = await import('node:os')
+    const path2 = await import('node:path')
+
+    const root = await fs2.mkdtemp(path2.join(os2.tmpdir(), 'adr-087-missing-'))
+    try {
+      await fs2.writeFile(path2.join(root, 'present.js'), '// still here')
+      // absent.js is intentionally never created.
+
+      const g: NeatGraph = new MultiDirectedGraph<GraphNode, GraphEdge>({ allowSelfLoops: false })
+      g.addNode('service:a', { id: 'service:a', type: NodeType.ServiceNode, name: 'a', language: 'javascript' })
+      g.addNode('infra:kafka-topic:orders', { id: 'infra:kafka-topic:orders', type: NodeType.InfraNode, name: 'orders', kind: 'kafka-topic', provider: 'self' })
+      g.addNode('infra:kafka-topic:gone', { id: 'infra:kafka-topic:gone', type: NodeType.InfraNode, name: 'gone', kind: 'kafka-topic', provider: 'self' })
+
+      const survivorId = 'PUBLISHES_TO:service:a->infra:kafka-topic:orders'
+      g.addEdgeWithKey(survivorId, 'service:a', 'infra:kafka-topic:orders', {
+        id: survivorId,
+        source: 'service:a',
+        target: 'infra:kafka-topic:orders',
+        type: EdgeType.PUBLISHES_TO,
+        provenance: Provenance.EXTRACTED,
+        evidence: {
+          file: 'absent.js',
+          sites: [{ file: 'absent.js' }, { file: 'present.js' }],
+        },
+      })
+
+      // Every backing site is gone — fully orphaned, must be dropped.
+      const ghostId = 'PUBLISHES_TO:service:a->infra:kafka-topic:gone'
+      g.addEdgeWithKey(ghostId, 'service:a', 'infra:kafka-topic:gone', {
+        id: ghostId,
+        source: 'service:a',
+        target: 'infra:kafka-topic:gone',
+        type: EdgeType.PUBLISHES_TO,
+        provenance: Provenance.EXTRACTED,
+        evidence: {
+          file: 'absent.js',
+          sites: [{ file: 'absent.js' }, { file: 'also-absent.js' }],
+        },
+      })
+
+      const dropped = retireExtractedEdgesByMissingFile(g, root)
+      expect(dropped).toBe(1)
+      expect(g.hasEdge(survivorId)).toBe(true)
+      expect(g.hasEdge(ghostId)).toBe(false)
+    } finally {
+      await fs2.rm(root, { recursive: true, force: true })
+    }
+  })
+})
+
 describe('CLI surface contract (ADR-050)', () => {
   // v0.2.8 #23. Nine `neat <verb>` commands mirroring the MCP allowlist.
   // Implementation lives in packages/core/src/cli.ts (dispatcher) +

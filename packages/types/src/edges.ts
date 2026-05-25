@@ -18,16 +18,38 @@ export const EdgeTypeSchema = z.enum([
   EdgeType.RUNS_ON,
 ])
 
+// One call-site origin for an EXTRACTED edge: file, plus optional line and
+// source snippet. Same shape as the representative evidence fields below —
+// `EdgeEvidence.sites` carries the full set when an edge is backed by more
+// than one call site (ADR-087 / #396).
+export const CallSiteSchema = z.object({
+  file: z.string(),
+  line: z.number().int().nonnegative().optional(),
+  snippet: z.string().optional(),
+})
+export type CallSite = z.infer<typeof CallSiteSchema>
+
 // Static-extraction evidence for an EXTRACTED edge (ADR-029, contract #5).
 // `file` is required — retire.ts keys ghost-edge cleanup off it. `line` and
 // `snippet` are optional because the existing extractors (configs.ts,
 // docker-compose.ts) record file-level evidence only; loosening lets those
 // edges through ADR-061's response-shape validation without forcing the
 // extractors to fabricate line numbers.
+//
+// ADR-087 / #396 — file-grain. A single EXTRACTED edge can be born from more
+// than one call site (the same target called from several files, or several
+// lines in one file). The CALLS-family producers used to keep the first site
+// and drop the rest; `sites` now carries every distinct origin.
+// `file`/`line`/`snippet` stay as the representative (first) site so
+// single-evidence consumers keep working: retire.ts keys ghost-edge cleanup
+// on `evidence.file`, and #395's single-evidence OBSERVED writes simply leave
+// `sites` unset. The field is optional and additive — an edge backed by
+// exactly one site may omit it. #393 (the file-native model) consumes `sites`.
 export const EdgeEvidenceSchema = z.object({
   file: z.string(),
   line: z.number().int().nonnegative().optional(),
   snippet: z.string().optional(),
+  sites: z.array(CallSiteSchema).optional(),
 })
 export type EdgeEvidence = z.infer<typeof EdgeEvidenceSchema>
 

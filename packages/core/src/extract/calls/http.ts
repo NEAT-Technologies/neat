@@ -2,7 +2,7 @@ import path from 'node:path'
 import Parser from 'tree-sitter'
 import JavaScript from 'tree-sitter-javascript'
 import Python from 'tree-sitter-python'
-import type { GraphEdge } from '@neat.is/types'
+import type { EdgeEvidence, GraphEdge } from '@neat.is/types'
 import {
   EdgeType,
   Provenance,
@@ -132,7 +132,14 @@ export async function addHttpCallEdges(
   let edgesAdded = 0
   for (const service of services) {
     const files = await loadSourceFiles(service.dir)
-    const seenTargets = new Map<string, { file: string; host: string }>()
+    // targetId → every distinct call site that reaches it. The first site is
+    // the representative (keeps `evidence.file`/`line` byte-identical to the
+    // pre-#396 first-write-wins behaviour, which retire.ts keys on); the rest
+    // used to be dropped and are now preserved per ADR-087 / #396.
+    const sitesByTarget = new Map<
+      string,
+      { sites: EdgeEvidence[]; keys: Set<string> }
+    >()
     for (const file of files) {
       // ADR-065 #1 — test-scope exclusion.
       if (isTestPath(file.path)) continue
@@ -147,25 +154,32 @@ export async function addHttpCallEdges(
       for (const t of targets) {
         const targetId = hostToNodeId.get(t)
         if (!targetId || targetId === service.node.id) continue
-        if (!seenTargets.has(targetId)) {
-          seenTargets.set(targetId, { file: file.path, host: t })
+        const line = lineOf(file.content, `//${t}`)
+        const ev: EdgeEvidence = {
+          file: path.relative(service.dir, file.path),
+          line,
+          snippet: snippet(file.content, line),
+        }
+        let entry = sitesByTarget.get(targetId)
+        if (!entry) {
+          entry = { sites: [], keys: new Set() }
+          sitesByTarget.set(targetId, entry)
+        }
+        const key = `${ev.file}|${ev.line ?? ''}`
+        if (!entry.keys.has(key)) {
+          entry.keys.add(key)
+          entry.sites.push(ev)
         }
       }
     }
-    for (const [targetId, evidenceFile] of seenTargets) {
-      const fileContent = files.find((f) => f.path === evidenceFile.file)?.content ?? ''
-      const line = lineOf(fileContent, `//${evidenceFile.host}`)
+    for (const [targetId, entry] of sitesByTarget) {
       // URL-string match against a registered service hostname is the
       // hostname-shape tier per ADR-066 — structurally tight (urlMatchesHost
       // requires scheme + exact hostname) but no framework-aware recognizer
       // confirms the call. Drops below the default precision floor (0.7) and
       // never enters the graph unless the floor is lowered for diagnostics.
       const confidence = confidenceForExtracted('hostname-shape-match')
-      const ev = {
-        file: path.relative(service.dir, evidenceFile.file),
-        line,
-        snippet: snippet(fileContent, line),
-      }
+      const rep = entry.sites[0]!
       const edgeId = makeEdgeId(service.node.id, targetId, EdgeType.CALLS)
       if (!passesExtractedFloor(confidence)) {
         noteExtractedDropped({
@@ -174,10 +188,14 @@ export async function addHttpCallEdges(
           type: EdgeType.CALLS,
           confidence,
           confidenceKind: 'hostname-shape-match',
-          evidence: ev,
+          evidence: rep,
         })
         continue
       }
+      // `sites` only when more than one origin backs the edge, so a
+      // single-site edge is unchanged from before #396.
+      const evidence: EdgeEvidence =
+        entry.sites.length > 1 ? { ...rep, sites: entry.sites } : rep
       const edge: GraphEdge = {
         id: edgeId,
         source: service.node.id,
@@ -185,7 +203,7 @@ export async function addHttpCallEdges(
         type: EdgeType.CALLS,
         provenance: Provenance.EXTRACTED,
         confidence,
-        evidence: ev,
+        evidence,
       }
       if (!graph.hasEdge(edge.id)) {
         graph.addEdgeWithKey(edge.id, edge.source, edge.target, edge)
