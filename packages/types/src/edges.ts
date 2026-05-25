@@ -57,6 +57,15 @@ export const GraphEdgeSchema = z.object({
   lastObserved: z.string().datetime().optional(),
   callCount: z.number().int().nonnegative().optional(),
   evidence: EdgeEvidenceSchema.optional(),
+  // #396 / ADR-087 — a single service→target edge can be born at several call
+  // sites. `evidence` keeps the first/primary site so retire.ts (which keys
+  // ghost-edge cleanup on `evidence.file`) and every single-evidence consumer
+  // read it exactly as before. `sites` additively lists every distinct site
+  // the edge was extracted from, with `sites[0]` mirroring `evidence`. It's
+  // only written when there's more than one site, so single-site edges and
+  // older snapshots stay byte-identical; sibling #395's single-evidence writes
+  // are unaffected.
+  sites: z.array(EdgeEvidenceSchema).optional(),
   signal: EdgeSignalSchema.optional(),
 })
 export type GraphEdge = z.infer<typeof GraphEdgeSchema>

@@ -1,6 +1,13 @@
 import path from 'node:path'
 import { infraId } from '@neat.is/types'
-import { lineOf, snippet, type ExternalEndpoint, type SourceFile } from './shared.js'
+import {
+  lineAt,
+  lineOf,
+  mergeEndpointSite,
+  snippet,
+  type ExternalEndpoint,
+  type SourceFile,
+} from './shared.js'
 
 // Client-construction in JS/TS:
 //
@@ -77,8 +84,8 @@ export function grpcEndpointsFromFile(
   file: SourceFile,
   serviceDir: string,
 ): ExternalEndpoint[] {
-  const out: ExternalEndpoint[] = []
-  const seen = new Set<string>()
+  const byName = new Map<string, ExternalEndpoint>()
+  const rel = path.relative(serviceDir, file.path)
   const ctx = readImports(file.content)
   GRPC_CLIENT_RE.lastIndex = 0
   let m: RegExpExecArray | null
@@ -86,13 +93,20 @@ export function grpcEndpointsFromFile(
     const symbol = m[1]!
     const addr = m[2]?.trim()
     const name = isLikelyAddress(addr) ? addr! : symbol
-    if (seen.has(name)) continue
     const classified = classifyClient(symbol, ctx)
     if (!classified) continue
-    seen.add(name)
+    const existing = byName.get(name)
+    if (existing) {
+      // The same client constructed again — keep it as a distinct call site
+      // (#396 / ADR-087). Line comes from this `new …Client(` match.
+      const line = lineAt(file.content, m.index)
+      mergeEndpointSite(existing, { file: rel, line, snippet: snippet(file.content, line) })
+      continue
+    }
     const { kind } = classified
+    // Primary evidence keeps `lineOf` so single-site emissions stay identical.
     const line = lineOf(file.content, m[0])
-    out.push({
+    byName.set(name, {
       infraId: infraId(kind, name),
       name,
       kind,
@@ -102,11 +116,11 @@ export function grpcEndpointsFromFile(
       // tier (ADR-066).
       confidenceKind: 'verified-call-site',
       evidence: {
-        file: path.relative(serviceDir, file.path),
+        file: rel,
         line,
         snippet: snippet(file.content, line),
       },
     })
   }
-  return out
+  return [...byName.values()]
 }

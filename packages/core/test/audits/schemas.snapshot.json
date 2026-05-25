@@ -148,6 +148,26 @@
                           }
                         }
                       },
+                      "sites": {
+                        "_optional": {
+                          "_array": {
+                            "_object": {
+                              "file": "_string",
+                              "line": {
+                                "_optional": {
+                                  "_number": [
+                                    "int",
+                                    "min"
+                                  ]
+                                }
+                              },
+                              "snippet": {
+                                "_optional": "_string"
+                              }
+                            }
+                          }
+                        }
+                      },
                       "source": "_string",
                       "target": "_string",
                       "type": {
@@ -264,6 +284,26 @@
                                 "int",
                                 "min"
                               ]
+                            }
+                          }
+                        }
+                      },
+                      "sites": {
+                        "_optional": {
+                          "_array": {
+                            "_object": {
+                              "file": "_string",
+                              "line": {
+                                "_optional": {
+                                  "_number": [
+                                    "int",
+                                    "min"
+                                  ]
+                                }
+                              },
+                              "snippet": {
+                                "_optional": "_string"
+                              }
                             }
                           }
                         }
@@ -422,6 +462,26 @@
                           }
                         }
                       },
+                      "sites": {
+                        "_optional": {
+                          "_array": {
+                            "_object": {
+                              "file": "_string",
+                              "line": {
+                                "_optional": {
+                                  "_number": [
+                                    "int",
+                                    "min"
+                                  ]
+                                }
+                              },
+                              "snippet": {
+                                "_optional": "_string"
+                              }
+                            }
+                          }
+                        }
+                      },
                       "source": "_string",
                       "target": "_string",
                       "type": {
@@ -573,6 +633,26 @@
                     }
                   }
                 },
+                "sites": {
+                  "_optional": {
+                    "_array": {
+                      "_object": {
+                        "file": "_string",
+                        "line": {
+                          "_optional": {
+                            "_number": [
+                              "int",
+                              "min"
+                            ]
+                          }
+                        },
+                        "snippet": {
+                          "_optional": "_string"
+                        }
+                      }
+                    }
+                  }
+                },
                 "source": "_string",
                 "target": "_string",
                 "type": {
@@ -689,6 +769,26 @@
                           "int",
                           "min"
                         ]
+                      }
+                    }
+                  }
+                },
+                "sites": {
+                  "_optional": {
+                    "_array": {
+                      "_object": {
+                        "file": "_string",
+                        "line": {
+                          "_optional": {
+                            "_number": [
+                              "int",
+                              "min"
+                            ]
+                          }
+                        },
+                        "snippet": {
+                          "_optional": "_string"
+                        }
                       }
                     }
                   }
@@ -843,6 +943,26 @@
                           "int",
                           "min"
                         ]
+                      }
+                    }
+                  }
+                },
+                "sites": {
+                  "_optional": {
+                    "_array": {
+                      "_object": {
+                        "file": "_string",
+                        "line": {
+                          "_optional": {
+                            "_number": [
+                              "int",
+                              "min"
+                            ]
+                          }
+                        },
+                        "snippet": {
+                          "_optional": "_string"
+                        }
                       }
                     }
                   }
@@ -1020,6 +1140,26 @@
                 "int",
                 "min"
               ]
+            }
+          }
+        }
+      },
+      "sites": {
+        "_optional": {
+          "_array": {
+            "_object": {
+              "file": "_string",
+              "line": {
+                "_optional": {
+                  "_number": [
+                    "int",
+                    "min"
+                  ]
+                }
+              },
+              "snippet": {
+                "_optional": "_string"
+              }
             }
           }
         }

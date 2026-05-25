@@ -1,6 +1,13 @@
 import path from 'node:path'
 import { infraId } from '@neat.is/types'
-import { lineOf, snippet, type ExternalEndpoint, type SourceFile } from './shared.js'
+import {
+  lineAt,
+  lineOf,
+  mergeEndpointSite,
+  snippet,
+  type ExternalEndpoint,
+  type SourceFile,
+} from './shared.js'
 
 // Match `producer.send({ topic: "orders" ... })` and `producer.send({
 // topic: 'orders' })` plus the two-arg form `producer.send("orders", ...)`.
@@ -25,14 +32,25 @@ export function kafkaEndpointsFromFile(
   file: SourceFile,
   serviceDir: string,
 ): ExternalEndpoint[] {
-  const out: ExternalEndpoint[] = []
-  const seen = new Set<string>()
-  const make = (topic: string, edgeType: 'PUBLISHES_TO' | 'CONSUMES_FROM'): void => {
+  const byKey = new Map<string, ExternalEndpoint>()
+  const rel = path.relative(serviceDir, file.path)
+  const make = (
+    topic: string,
+    edgeType: 'PUBLISHES_TO' | 'CONSUMES_FROM',
+    index: number,
+  ): void => {
     const key = `${edgeType}|${topic}`
-    if (seen.has(key)) return
-    seen.add(key)
+    const existing = byKey.get(key)
+    if (existing) {
+      // Same topic produced/consumed again from another statement — keep it as
+      // a distinct call site (#396 / ADR-087). Line comes from this match.
+      const line = lineAt(file.content, index)
+      mergeEndpointSite(existing, { file: rel, line, snippet: snippet(file.content, line) })
+      return
+    }
+    // Primary evidence keeps `lineOf` so single-site emissions stay identical.
     const line = lineOf(file.content, topic)
-    out.push({
+    byKey.set(key, {
       infraId: infraId('kafka-topic', topic),
       name: topic,
       kind: 'kafka-topic',
@@ -42,14 +60,16 @@ export function kafkaEndpointsFromFile(
       // tier (ADR-066).
       confidenceKind: 'verified-call-site',
       evidence: {
-        file: path.relative(serviceDir, file.path),
+        file: rel,
         line,
         snippet: snippet(file.content, line),
       },
     })
   }
 
-  for (const { topic } of findAll(PRODUCER_TOPIC_RE, file.content)) make(topic, 'PUBLISHES_TO')
-  for (const { topic } of findAll(CONSUMER_TOPIC_RE, file.content)) make(topic, 'CONSUMES_FROM')
-  return out
+  for (const { topic, index } of findAll(PRODUCER_TOPIC_RE, file.content))
+    make(topic, 'PUBLISHES_TO', index)
+  for (const { topic, index } of findAll(CONSUMER_TOPIC_RE, file.content))
+    make(topic, 'CONSUMES_FROM', index)
+  return [...byKey.values()]
 }

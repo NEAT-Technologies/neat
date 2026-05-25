@@ -1,6 +1,13 @@
 import path from 'node:path'
 import { infraId } from '@neat.is/types'
-import { lineOf, snippet, type ExternalEndpoint, type SourceFile } from './shared.js'
+import {
+  lineAt,
+  lineOf,
+  mergeEndpointSite,
+  snippet,
+  type ExternalEndpoint,
+  type SourceFile,
+} from './shared.js'
 
 // AWS SDK v3 calls. We catch S3 (`Bucket: "x"` near a `S3Client`-using
 // PutObjectCommand / GetObjectCommand / DeleteObjectCommand) and DynamoDB
@@ -29,14 +36,21 @@ export function awsEndpointsFromFile(
   file: SourceFile,
   serviceDir: string,
 ): ExternalEndpoint[] {
-  const out: ExternalEndpoint[] = []
-  const seen = new Set<string>()
-  const make = (kind: string, name: string): void => {
+  const byKey = new Map<string, ExternalEndpoint>()
+  const rel = path.relative(serviceDir, file.path)
+  const make = (kind: string, name: string, index: number): void => {
     const key = `${kind}|${name}`
-    if (seen.has(key)) return
-    seen.add(key)
+    const existing = byKey.get(key)
+    if (existing) {
+      // Same bucket/table referenced again — keep it as a distinct call site
+      // (#396 / ADR-087). Line comes from this match's offset.
+      const line = lineAt(file.content, index)
+      mergeEndpointSite(existing, { file: rel, line, snippet: snippet(file.content, line) })
+      return
+    }
+    // Primary evidence keeps `lineOf` so single-site emissions stay identical.
     const line = lineOf(file.content, name)
-    out.push({
+    byKey.set(key, {
       infraId: infraId(kind, name),
       name,
       kind,
@@ -46,7 +60,7 @@ export function awsEndpointsFromFile(
       // (ADR-066).
       confidenceKind: 'verified-call-site',
       evidence: {
-        file: path.relative(serviceDir, file.path),
+        file: rel,
         line,
         snippet: snippet(file.content, line),
       },
@@ -54,7 +68,7 @@ export function awsEndpointsFromFile(
   }
 
   if (hasMarker(file.content, ['S3Client', 'PutObjectCommand', 'GetObjectCommand', 'DeleteObjectCommand'])) {
-    for (const { name } of findAll(S3_BUCKET_RE, file.content)) make('s3-bucket', name)
+    for (const { name, index } of findAll(S3_BUCKET_RE, file.content)) make('s3-bucket', name, index)
   }
   if (
     hasMarker(file.content, [
@@ -67,7 +81,7 @@ export function awsEndpointsFromFile(
       'DeleteCommand',
     ])
   ) {
-    for (const { name } of findAll(DYNAMO_TABLE_RE, file.content)) make('dynamodb-table', name)
+    for (const { name, index } of findAll(DYNAMO_TABLE_RE, file.content)) make('dynamodb-table', name, index)
   }
-  return out
+  return [...byKey.values()]
 }

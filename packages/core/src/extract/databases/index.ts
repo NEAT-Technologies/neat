@@ -2,6 +2,7 @@ import path from 'node:path'
 import type {
   CompatibleDriver,
   DatabaseNode,
+  EdgeEvidence,
   GraphEdge,
   GraphNode,
   ServiceNode,
@@ -192,6 +193,14 @@ export async function addDatabasesAndCompat(
 
   for (const service of services) {
     const merged = new Map<string, DbConfig>()
+    // Every distinct config file that points at a given host, in parser /
+    // discovery order (#396 / ADR-087). The host's canonical config still
+    // comes from `merged` (first-wins), but each file it was declared in is
+    // kept as a CONNECTS_TO site. File-only evidence — config/infra stay
+    // line-less per the file-awareness contract.
+    const sitesByHost = new Map<string, EdgeEvidence[]>()
+    const relSource = (config: DbConfig): string =>
+      path.relative(scanPath, config.sourceFile).split(path.sep).join('/')
     for (const parser of DB_PARSERS) {
       let configs: DbConfig[]
       try {
@@ -205,6 +214,13 @@ export async function addDatabasesAndCompat(
       for (const config of configs) {
         if (!config.host) continue
         if (!merged.has(config.host)) merged.set(config.host, config)
+        const file = relSource(config)
+        const sites = sitesByHost.get(config.host)
+        if (sites) {
+          if (!sites.some((s) => s.file === file)) sites.push({ file })
+        } else {
+          sitesByHost.set(config.host, [{ file }])
+        }
       }
     }
 
@@ -229,6 +245,7 @@ export async function addDatabasesAndCompat(
       }
       // DB connection from a parsed config file is a direct AST/file fact —
       // structural tier per ADR-066.
+      const sites = sitesByHost.get(config.host) ?? []
       const edge: GraphEdge = {
         id: makeEdgeId(service.node.id, dbNode.id, EdgeType.CONNECTS_TO),
         source: service.node.id,
@@ -240,8 +257,13 @@ export async function addDatabasesAndCompat(
         // Ghost-edge cleanup keys retirement on this; the conditional
         // sourceFile spread that used to live here was a v0.1.x leftover.
         evidence: {
-          file: path.relative(scanPath, config.sourceFile).split(path.sep).join('/'),
+          file: relSource(config),
         },
+        // #396 / ADR-087 — when the same host is declared in more than one
+        // config file, keep each as a distinct site. `sites[0]` mirrors
+        // `evidence` (both come from the first-wins config). Single-file hosts
+        // stay byte-identical with no `sites` key.
+        ...(sites.length > 1 ? { sites } : {}),
       }
       if (!graph.hasEdge(edge.id)) {
         graph.addEdgeWithKey(edge.id, edge.source, edge.target, edge)

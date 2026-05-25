@@ -2,7 +2,7 @@ import path from 'node:path'
 import Parser from 'tree-sitter'
 import JavaScript from 'tree-sitter-javascript'
 import Python from 'tree-sitter-python'
-import type { GraphEdge } from '@neat.is/types'
+import type { EdgeEvidence, GraphEdge } from '@neat.is/types'
 import {
   EdgeType,
   Provenance,
@@ -132,7 +132,10 @@ export async function addHttpCallEdges(
   let edgesAdded = 0
   for (const service of services) {
     const files = await loadSourceFiles(service.dir)
-    const seenTargets = new Map<string, { file: string; host: string }>()
+    // Every distinct call site per target instead of the first file only
+    // (#396 / ADR-087). Insertion order is file-walk order, so `sites[0]`
+    // stays the same primary evidence first-write-wins produced before.
+    const sitesByTarget = new Map<string, EdgeEvidence[]>()
     for (const file of files) {
       // ADR-065 #1 — test-scope exclusion.
       if (isTestPath(file.path)) continue
@@ -147,25 +150,32 @@ export async function addHttpCallEdges(
       for (const t of targets) {
         const targetId = hostToNodeId.get(t)
         if (!targetId || targetId === service.node.id) continue
-        if (!seenTargets.has(targetId)) {
-          seenTargets.set(targetId, { file: file.path, host: t })
+        // `callsFromSource` dedupes hosts per file, so each file contributes at
+        // most one site per target — the URL literal's line. `//${host}` is the
+        // scheme-relative form so this lands on the URL, matching the prior
+        // primary-evidence line computation exactly.
+        const line = lineOf(file.content, `//${t}`)
+        const ev: EdgeEvidence = {
+          file: path.relative(service.dir, file.path),
+          line,
+          snippet: snippet(file.content, line),
+        }
+        const sites = sitesByTarget.get(targetId)
+        if (sites) {
+          if (!sites.some((s) => s.file === ev.file && s.line === ev.line)) sites.push(ev)
+        } else {
+          sitesByTarget.set(targetId, [ev])
         }
       }
     }
-    for (const [targetId, evidenceFile] of seenTargets) {
-      const fileContent = files.find((f) => f.path === evidenceFile.file)?.content ?? ''
-      const line = lineOf(fileContent, `//${evidenceFile.host}`)
+    for (const [targetId, sites] of sitesByTarget) {
+      const ev = sites[0]!
       // URL-string match against a registered service hostname is the
       // hostname-shape tier per ADR-066 — structurally tight (urlMatchesHost
       // requires scheme + exact hostname) but no framework-aware recognizer
       // confirms the call. Drops below the default precision floor (0.7) and
       // never enters the graph unless the floor is lowered for diagnostics.
       const confidence = confidenceForExtracted('hostname-shape-match')
-      const ev = {
-        file: path.relative(service.dir, evidenceFile.file),
-        line,
-        snippet: snippet(fileContent, line),
-      }
       const edgeId = makeEdgeId(service.node.id, targetId, EdgeType.CALLS)
       if (!passesExtractedFloor(confidence)) {
         noteExtractedDropped({
@@ -186,6 +196,9 @@ export async function addHttpCallEdges(
         provenance: Provenance.EXTRACTED,
         confidence,
         evidence: ev,
+        // Only carry `sites` when there's more than one — single-site edges
+        // stay byte-identical to the prior shape.
+        ...(sites.length > 1 ? { sites } : {}),
       }
       if (!graph.hasEdge(edge.id)) {
         graph.addEdgeWithKey(edge.id, edge.source, edge.target, edge)

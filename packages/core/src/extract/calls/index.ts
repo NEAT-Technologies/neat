@@ -1,4 +1,4 @@
-import type { GraphEdge, InfraNode } from '@neat.is/types'
+import type { EdgeEvidence, GraphEdge, InfraNode } from '@neat.is/types'
 import {
   EdgeType,
   NodeType,
@@ -74,7 +74,8 @@ async function addExternalEndpointEdges(
     }
     if (endpoints.length === 0) continue
 
-    const seenEdges = new Set<string>()
+    // Create the InfraNode for each distinct target (idempotent, first-wins on
+    // attributes — unchanged from before).
     for (const ep of endpoints) {
       if (!graph.hasNode(ep.infraId)) {
         const node: InfraNode = {
@@ -90,11 +91,31 @@ async function addExternalEndpointEdges(
         graph.addNode(node.id, node)
         nodesAdded++
       }
+    }
 
+    // Aggregate every distinct call site per service→target edge (#396 /
+    // ADR-087). The first endpoint for an edge sets the primary evidence and
+    // confidence (unchanged first-write-wins); later endpoints — from the same
+    // file or other files — contribute additional sites.
+    const byEdge = new Map<
+      string,
+      { ep: ExternalEndpoint; edgeType: (typeof EdgeType)[keyof typeof EdgeType]; sites: EdgeEvidence[] }
+    >()
+    for (const ep of endpoints) {
       const edgeType = edgeTypeFromEndpoint(ep)
       const edgeId = makeEdgeId(service.node.id, ep.infraId, edgeType)
-      if (seenEdges.has(edgeId)) continue
-      seenEdges.add(edgeId)
+      const epSites = ep.sites ?? [ep.evidence]
+      const acc = byEdge.get(edgeId)
+      if (acc) {
+        for (const s of epSites) {
+          if (!acc.sites.some((x) => x.file === s.file && x.line === s.line)) acc.sites.push(s)
+        }
+      } else {
+        byEdge.set(edgeId, { ep, edgeType, sites: [...epSites] })
+      }
+    }
+
+    for (const [edgeId, { ep, edgeType, sites }] of byEdge) {
       const confidence = confidenceForExtracted(ep.confidenceKind)
       // Precision floor (ADR-066 §3). Sub-threshold candidates are computed
       // but never added to the graph; the banner reports the drop count.
@@ -118,6 +139,9 @@ async function addExternalEndpointEdges(
           provenance: Provenance.EXTRACTED,
           confidence,
           evidence: ep.evidence,
+          // Only carry `sites` when there's more than one — single-site edges
+          // stay byte-identical to the prior shape.
+          ...(sites.length > 1 ? { sites } : {}),
         }
         graph.addEdgeWithKey(edgeId, edge.source, edge.target, edge)
         edgesAdded++
