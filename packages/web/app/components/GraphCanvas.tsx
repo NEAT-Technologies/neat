@@ -1,12 +1,16 @@
 'use client'
 
-import { useEffect, useRef, useCallback } from 'react'
+import { useEffect, useRef, useCallback, useState } from 'react'
 import type { GraphNode, GraphEdge } from '@neat.is/types'
 import type { GraphData } from './AppShell'
 import { authedFetch, authedEventSourceUrl } from '../../lib/authed-fetch'
+import { buildModel, visibleGraph, type FileFirstModel } from './graph-model'
+import { GLYPH_LEGEND } from './glyphs'
 
-// Map NEAT node types to design visual types
+// Map NEAT node types to design visual types. FileNode is the primary node of
+// the file-first graph and gets its own square shape.
 function visualType(node: GraphNode): string {
+  if (node.type === 'FileNode') return 'file'
   if (node.type === 'ServiceNode') return 'service'
   if (node.type === 'DatabaseNode') return 'db'
   if (node.type === 'ConfigNode') return 'storage'
@@ -34,7 +38,16 @@ function edgeVerb(type: string): string {
   return type.toLowerCase().replace(/_/g, ' ')
 }
 
-const COMPOUND_TYPES = new Set(['cloud', 'env', 'vpc', 'cluster', 'namespace'])
+// A FileNode's display label is its basename — the full service-relative path
+// lives in the Inspector. Keeps the canvas legible when a service expands.
+function nodeLabel(node: GraphNode): string {
+  if (node.type === 'FileNode') {
+    const p = (node as { path?: string }).path ?? node.id
+    const parts = p.split('/')
+    return parts[parts.length - 1] || p
+  }
+  return (node as { name?: string }).name ?? node.id
+}
 
 interface GraphCanvasProps {
   project: string
@@ -42,17 +55,40 @@ interface GraphCanvasProps {
   onNodeSelect: (id: string) => void
   onGraphLoaded: (data: GraphData) => void
   onCyReady?: (cy: unknown) => void
+  // file-awareness §2/§3 drill state, owned by AppShell
+  expanded: Set<string>
+  onExpandService: (id: string) => void
+  onCollapseService: (id: string) => void
+  onCollapseAll: () => void
 }
 
-export function GraphCanvas({ project, selectedNodeId, onNodeSelect, onGraphLoaded, onCyReady }: GraphCanvasProps) {
+export function GraphCanvas({
+  project,
+  selectedNodeId,
+  onNodeSelect,
+  onGraphLoaded,
+  onCyReady,
+  expanded,
+  onExpandService,
+  onCollapseService,
+  onCollapseAll,
+}: GraphCanvasProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const minimapCanvasRef = useRef<HTMLCanvasElement>(null)
   const minimapFrameRef = useRef<HTMLDivElement>(null)
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const cyRef = useRef<any>(null)
   const provFilterRef = useRef<Set<string>>(new Set())
-  const metaRef = useRef({ nodeCount: 0, edgeCount: 0 })
   const sseRef = useRef<EventSource | null>(null)
+  // the full file-first graph as last loaded — drill state recomputes the
+  // visible subset off this without re-fetching.
+  const fullRef = useRef<GraphData>({ nodes: [], edges: [] })
+  const modelRef = useRef<FileFirstModel | null>(null)
+  const expandedRef = useRef(expanded)
+  expandedRef.current = expanded
+
+  // breadcrumb of expanded services, in insertion order (for the in-canvas nav)
+  const [crumbs, setCrumbs] = useState<{ id: string; name: string }[]>([])
 
   const drawMinimap = useCallback(() => {
     const cy = cyRef.current
@@ -83,14 +119,13 @@ export function GraphCanvas({ project, selectedNodeId, onNodeSelect, onGraphLoad
     cy.edges().forEach((e: { source: () => { position: () => { x: number; y: number } }; target: () => { position: () => { x: number; y: number } }; data: (k: string) => string }) => {
       const a = e.source().position()
       const b = e.target().position()
-      ctx.strokeStyle = e.data('_color') + '55'
+      ctx.strokeStyle = (e.data('_color') || '#888') + '55'
       ctx.beginPath()
       ctx.moveTo(a.x * s + ox, a.y * s + oy)
       ctx.lineTo(b.x * s + ox, b.y * s + oy)
       ctx.stroke()
     })
     cy.nodes().forEach((n: { data: (k: string) => string | boolean; position: () => { x: number; y: number } }) => {
-      if (n.data('_isCompound')) return
       const p = n.position()
       ctx.fillStyle = (n.data('_color') as string) || '#888'
       ctx.beginPath()
@@ -109,6 +144,209 @@ export function GraphCanvas({ project, selectedNodeId, onNodeSelect, onGraphLoad
     mmFrame.style.height = Math.min(rect.height - Math.max(0, fy), fh) + 'px'
   }, [])
 
+  // Cytoscape style — shapes carry node kind, line treatment carries
+  // provenance. Monochrome on black; the glyph shape, not hue, draws kinds
+  // apart, matching the marketing legend.
+  const buildStyle = useCallback(() => {
+    const cssVar = (name: string) =>
+      getComputedStyle(document.documentElement).getPropertyValue(name).trim()
+    const fg = cssVar('--fg') || '#fff'
+    const muted = cssVar('--fg-muted') || '#888'
+    const rule = cssVar('--rule') || '#333'
+    const observed = cssVar('--prov-observed') || '#5fcf9e'
+    return [
+      {
+        selector: 'node',
+        style: {
+          'background-color': 'data(_color)',
+          'background-opacity': 1,
+          shape: 'data(_shape)',
+          width: 'data(_size)',
+          height: 'data(_size)',
+          label: 'data(label)',
+          'text-valign': 'bottom',
+          'text-halign': 'center',
+          'text-margin-y': 7,
+          'font-family': 'DM Mono, monospace',
+          'font-size': 9,
+          color: muted,
+          'text-outline-width': 2,
+          'text-outline-color': '#000',
+          'border-width': 1,
+          'border-color': '#000',
+          'min-zoomed-font-size': 7,
+        },
+      },
+      // service container — outline hexagon-ish rounded rect, drawn as a
+      // collapsed grouping the operator opens. Larger, hollow, labelled above.
+      {
+        selector: 'node.t-service',
+        style: {
+          'background-color': '#000',
+          'background-opacity': 1,
+          'border-color': muted,
+          'border-width': 1.4,
+          shape: 'round-rectangle',
+          width: 46,
+          height: 46,
+          color: fg,
+          'font-size': 10,
+        },
+      },
+      { selector: 'node.t-service.expanded', style: { 'border-color': fg, 'border-style': 'dashed' } },
+      // file — the primary node, filled white square
+      {
+        selector: 'node.t-file',
+        style: { 'background-color': fg, shape: 'rectangle', width: 16, height: 16, color: fg },
+      },
+      { selector: 'node.t-db',       style: { 'background-color': muted, shape: 'ellipse', width: 26, height: 26 } },
+      { selector: 'node.t-storage',  style: { 'background-color': '#000', 'border-color': muted, 'border-width': 1.2, shape: 'rectangle', width: 22, height: 16 } },
+      { selector: 'node.t-external', style: { 'background-color': '#000', 'border-color': muted, 'border-width': 1, 'border-style': 'dashed', shape: 'pentagon', width: 26, height: 26 } },
+      { selector: 'node.t-compute',  style: { 'background-color': muted, shape: 'diamond', width: 24, height: 24 } },
+      { selector: 'node.t-cluster, node.t-namespace, node.t-vpc', style: { 'background-color': '#000', 'border-color': rule, 'border-width': 1, shape: 'triangle', width: 26, height: 26 } },
+      {
+        selector: 'node:selected',
+        style: {
+          'border-color': fg,
+          'border-width': 2,
+          color: fg,
+          'z-index': 999,
+        },
+      },
+      { selector: '.dim', style: { opacity: 0.16 } },
+      { selector: 'edge.dim', style: { opacity: 0.06 } },
+      { selector: 'node.hl, edge.hl', style: { opacity: 1 } },
+      { selector: 'edge.hl', style: { width: 1.8, opacity: 1 } },
+      {
+        selector: 'edge',
+        style: {
+          'curve-style': 'bezier',
+          'control-point-step-size': 32,
+          'line-color': 'data(_color)',
+          'line-style': 'data(_style)',
+          width: 'data(_width)',
+          opacity: 'data(_opacity)',
+          'target-arrow-shape': 'triangle',
+          'target-arrow-color': 'data(_color)',
+          'arrow-scale': 0.7,
+          'font-family': 'DM Mono, monospace',
+          'font-size': 7,
+          color: muted,
+          'text-rotation': 'autorotate',
+          'text-background-color': '#000',
+          'text-background-opacity': 1,
+          'text-background-padding': 2,
+        },
+      },
+      { selector: 'edge[type]', style: { label: 'data(type)', 'min-zoomed-font-size': 13 } },
+      // observed gets the live accent on its arrow
+      { selector: 'edge.p-OBSERVED', style: { 'line-color': observed, 'target-arrow-color': observed } },
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    ] as any
+  }, [])
+
+  // Translate a node/edge into a cytoscape element. Shapes + colors come from
+  // the marketing palette via CSS vars resolved in buildStyle's selectors;
+  // here we only need the per-element data the style binds to.
+  const nodeElement = useCallback((n: GraphNode) => {
+    const vt = visualType(n)
+    const cssVar = (name: string) => getComputedStyle(document.documentElement).getPropertyValue(name).trim()
+    const colorVar = vt === 'file' ? '--n-file' : vt === 'service' ? '--n-service' : `--n-${vt}`
+    const color = cssVar(colorVar) || cssVar('--fg-muted') || '#888'
+    return {
+      data: {
+        id: n.id,
+        label: nodeLabel(n),
+        type: vt,
+        _color: color,
+        _shape: 'ellipse',
+        _size: 24,
+        _nodeType: n.type,
+        _raw: n,
+      },
+      classes: `t-${vt}`,
+    }
+  }, [])
+
+  const edgeElement = useCallback((e: GraphEdge & { _origSource?: string; _origTarget?: string }) => {
+    const vp = visualProv(e.provenance)
+    const cssVar = (name: string) => getComputedStyle(document.documentElement).getPropertyValue(name).trim()
+    const color = vp === 'OBSERVED' ? (cssVar('--prov-observed') || '#5fcf9e') : (cssVar('--fg-muted') || '#888')
+    return {
+      data: {
+        id: e.id,
+        source: e.source,
+        target: e.target,
+        type: edgeVerb(e.type),
+        provenance: vp,
+        confidence: e.confidence,
+        _color: color,
+        _width: vp === 'OBSERVED' ? 1.4 : vp === 'INFERRED' ? 1 : 1.2,
+        _style: vp === 'INFERRED' ? 'dotted' : vp === 'OBSERVED' ? 'dashed' : 'solid',
+        _opacity: vp === 'INFERRED' ? 0.5 : vp === 'OBSERVED' ? 0.9 : 0.7,
+      },
+      classes: `p-${vp}`,
+    }
+  }, [])
+
+  // Recompute the visible cytoscape elements from the full graph + drill
+  // state. Called on load, on drill in/out, and on SSE updates. Never rolls
+  // file edges into service edges (file-awareness §3) — visibleGraph keeps
+  // every rendered edge file-grained, re-anchoring a hidden file's endpoint
+  // onto its collapsed-service container without summarizing.
+  const rerender = useCallback((animate: boolean) => {
+    const cy = cyRef.current
+    const model = modelRef.current
+    if (!cy || !model) return
+    const full = fullRef.current
+    const vis = visibleGraph(full.nodes, full.edges, model, expandedRef.current)
+
+    cy.elements().remove()
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const els: any[] = []
+    for (const n of vis.nodes) {
+      const el = nodeElement(n)
+      if (n.type === 'ServiceNode' && expandedRef.current.has(n.id)) {
+        el.classes += ' expanded'
+      }
+      els.push(el)
+    }
+    for (const e of vis.edges) els.push(edgeElement(e))
+    cy.add(els)
+
+    cy.layout({
+      name: 'cose',
+      animate,
+      randomize: !animate,
+      idealEdgeLength: 90,
+      nodeRepulsion: 9000,
+      edgeElasticity: 80,
+      gravity: 0.4,
+      numIter: animate ? 1000 : 2000,
+      componentSpacing: 110,
+      padding: 40,
+      fit: true,
+    }).run()
+
+    // refresh canvas meta tag
+    const metaEl = document.querySelector('.canvas-tag .meta')
+    if (metaEl) {
+      const fileCount = vis.nodes.filter((n) => n.type === 'FileNode').length
+      const svcCount = vis.nodes.filter((n) => n.type === 'ServiceNode').length
+      metaEl.textContent = `${svcCount} services · ${fileCount} files · ${vis.edges.length} edges`
+    }
+    // refresh provenance counts (off the full graph so they don't jump while drilling)
+    const counts: Record<string, number> = { STATIC: 0, OBSERVED: 0, INFERRED: 0 }
+    full.edges.forEach((e) => {
+      if (e.type === 'CONTAINS') return
+      counts[visualProv(e.provenance)] += 1
+    })
+    const set = (id: string, v: number) => { const el = document.getElementById(id); if (el) el.textContent = String(v) }
+    set('ct-static', counts.STATIC)
+    set('ct-observed', counts.OBSERVED)
+    set('ct-inferred', counts.INFERRED)
+  }, [nodeElement, edgeElement])
+
   // Pan + select node when selectedNodeId is set from outside (search, URL, incidents link)
   useEffect(() => {
     const cy = cyRef.current
@@ -121,11 +359,23 @@ export function GraphCanvas({ project, selectedNodeId, onNodeSelect, onGraphLoad
     }
   }, [selectedNodeId])
 
+  // React to drill-state changes by recomputing the visible subset.
+  useEffect(() => {
+    const model = modelRef.current
+    if (!model) return
+    rerender(true)
+    setCrumbs(
+      [...expanded].map((id) => {
+        const n = model.byId.get(id) as { name?: string } | undefined
+        return { id, name: n?.name ?? id.replace(/^service:/, '') }
+      }),
+    )
+  }, [expanded, rerender])
+
   useEffect(() => {
     let destroyed = false
 
     async function init() {
-      // Dynamic import avoids SSR issues
       const cytoscape = (await import('cytoscape')).default
 
       // ADR-057 #5 — every API call carries the active project.
@@ -134,220 +384,36 @@ export function GraphCanvas({ project, selectedNodeId, onNodeSelect, onGraphLoad
       const data: GraphData = await res.json()
       if (destroyed) return
 
+      fullRef.current = data
+      modelRef.current = buildModel(data.nodes, data.edges)
+      // Inspector consumes the full file-first graph so file→target detail and
+      // service→files are both available regardless of what the canvas shows.
       onGraphLoaded(data)
-      metaRef.current = { nodeCount: data.nodes.length, edgeCount: data.edges.length }
-
-      const cssVar = (name: string) =>
-        getComputedStyle(document.documentElement).getPropertyValue(name).trim()
-
-      const TYPE_STYLE: Record<string, { color: string; shape: string; size?: number }> = {
-        service:   { color: cssVar('--n-service'),   shape: 'round-rectangle', size: 32 },
-        db:        { color: cssVar('--n-db'),         shape: 'barrel',          size: 34 },
-        cache:     { color: cssVar('--n-cache'),      shape: 'barrel',          size: 28 },
-        stream:    { color: cssVar('--n-stream'),     shape: 'cut-rectangle',   size: 32 },
-        queue:     { color: cssVar('--n-queue'),      shape: 'cut-rectangle',   size: 28 },
-        lambda:    { color: cssVar('--n-lambda'),     shape: 'diamond',         size: 30 },
-        cron:      { color: cssVar('--n-cron'),       shape: 'tag',             size: 26 },
-        api:       { color: cssVar('--n-api'),        shape: 'round-rectangle', size: 22 },
-        apigw:     { color: cssVar('--n-apigw'),      shape: 'round-rectangle', size: 36 },
-        compute:   { color: cssVar('--n-compute'),    shape: 'round-rectangle', size: 32 },
-        storage:   { color: cssVar('--n-storage'),    shape: 'round-tag',       size: 28 },
-        external:  { color: cssVar('--n-external'),   shape: 'round-octagon',   size: 30 },
-        search:    { color: cssVar('--n-search'),     shape: 'barrel',          size: 28 },
-        cluster:   { color: cssVar('--n-cluster'),    shape: 'round-rectangle' },
-        namespace: { color: cssVar('--n-namespace'),  shape: 'round-rectangle' },
-        vpc:       { color: cssVar('--n-vpc'),        shape: 'round-rectangle' },
-        env:       { color: cssVar('--n-env'),        shape: 'round-rectangle' },
-        cloud:     { color: cssVar('--ink-3'),        shape: 'round-rectangle' },
-      }
-
-      const provColor: Record<string, string> = {
-        STATIC:   cssVar('--prov-static'),
-        OBSERVED: cssVar('--prov-observed'),
-        INFERRED: cssVar('--prov-inferred'),
-      }
-
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const elements: any[] = []
-      data.nodes.forEach((n: GraphNode) => {
-        const vt = visualType(n)
-        const ts = TYPE_STYLE[vt] ?? { color: '#888', shape: 'ellipse', size: 24 }
-        elements.push({
-          data: {
-            id: n.id,
-            label: (n as { name?: string }).name ?? n.id,
-            type: vt,
-            _color: ts.color,
-            _shape: ts.shape,
-            _size: ts.size ?? 28,
-            _isCompound: COMPOUND_TYPES.has(vt),
-            _nodeType: n.type,
-            _raw: n,
-          },
-          classes: `t-${vt} ${COMPOUND_TYPES.has(vt) ? 'compound' : 'leaf'}`,
-        })
-      })
-
-      data.edges.forEach((e: GraphEdge) => {
-        const vp = visualProv(e.provenance)
-        const color = provColor[vp] ?? '#888'
-        elements.push({
-          data: {
-            id: e.id,
-            source: e.source,
-            target: e.target,
-            type: edgeVerb(e.type),
-            provenance: vp,
-            confidence: e.confidence,
-            _color: color,
-            _width: vp === 'INFERRED' ? 1 : vp === 'OBSERVED' ? 1.4 : 1.2,
-            _style: vp === 'INFERRED' ? 'dotted' : vp === 'OBSERVED' ? 'dashed' : 'solid',
-            _opacity: vp === 'INFERRED' ? 0.55 : vp === 'OBSERVED' ? 0.85 : 0.75,
-          },
-        })
-      })
 
       const cy = cytoscape({
         container: containerRef.current,
-        elements,
+        elements: [],
         minZoom: 0.001,
         maxZoom: 50,
         wheelSensitivity: 0.25,
         autoungrabify: true,
         autounselectify: false,
         boxSelectionEnabled: false,
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        style: ([
-          {
-            selector: 'node.compound',
-            style: {
-              'background-color': 'data(_color)',
-              'background-opacity': 0.35,
-              'border-width': 1,
-              'border-color': '#2a2a30',
-              'border-style': 'solid',
-              shape: 'round-rectangle',
-              'corner-radius': '4',
-              label: 'data(label)',
-              'text-valign': 'top',
-              'text-halign': 'left',
-              'text-margin-x': 8,
-              'text-margin-y': 4,
-              'font-family': 'JetBrains Mono, monospace',
-              'font-size': 10.5,
-              color: '#9b968c',
-              padding: '24px',
-              'text-transform': 'lowercase',
-            },
-          },
-          { selector: 'node.t-cloud',     style: { 'background-opacity': 0.18, padding: '32px', 'font-size': 11.5, color: '#d8d3c9' } },
-          { selector: 'node.t-env',       style: { 'background-opacity': 0.3,  padding: '28px', 'font-size': 11,   color: '#d8d3c9' } },
-          { selector: 'node.t-vpc',       style: { 'background-opacity': 0.4,  padding: '22px', 'font-size': 10.5 } },
-          { selector: 'node.t-cluster',   style: { 'background-opacity': 0.55, padding: '20px' } },
-          { selector: 'node.t-namespace', style: { 'background-opacity': 0.65, padding: '16px' } },
-          {
-            selector: 'node.leaf',
-            style: {
-              'background-color': 'data(_color)',
-              'background-opacity': 0.92,
-              shape: 'data(_shape)',
-              width: 'data(_size)',
-              height: 'data(_size)',
-              label: 'data(label)',
-              'text-valign': 'bottom',
-              'text-halign': 'center',
-              'text-margin-y': 5,
-              'font-family': 'JetBrains Mono, monospace',
-              'font-size': 9.5,
-              color: '#d8d3c9',
-              'text-outline-width': 2,
-              'text-outline-color': '#0a0a0b',
-              'border-width': 1,
-              'border-color': '#0a0a0b',
-              'min-zoomed-font-size': 7,
-            },
-          },
-          { selector: 'node.t-api',      style: { width: 8,  height: 8,  'font-size': 8.5, color: '#9b968c' } },
-          { selector: 'node.t-cron',     style: { width: 18, height: 14 } },
-          { selector: 'node.t-external', style: { 'background-opacity': 0.7, 'border-color': '#46443f', 'border-width': 1, 'border-style': 'dashed', color: '#9b968c' } },
-          { selector: 'node.t-lambda',   style: { width: 22, height: 22 } },
-          { selector: 'node.t-queue',    style: { width: 20, height: 20 } },
-          {
-            selector: 'node:selected',
-            style: {
-              'border-color': cssVar('--accent'),
-              'border-width': 2,
-              'background-opacity': 1,
-              color: '#f4efe6',
-              'font-weight': 600,
-              'z-index': 999,
-            },
-          },
-          { selector: '.dim',      style: { opacity: 0.18 } },
-          { selector: 'edge.dim', style: { opacity: 0.08 } },
-          { selector: 'node.hl, edge.hl', style: { opacity: 1 } },
-          { selector: 'edge.hl',  style: { width: 'mapData(_width, 0, 2, 1.6, 2.4)', opacity: 1 } },
-          {
-            selector: 'edge',
-            style: {
-              'curve-style': 'bezier',
-              'control-point-step-size': 30,
-              'line-color': 'data(_color)',
-              'line-style': 'data(_style)',
-              width: 'data(_width)',
-              opacity: 'data(_opacity)',
-              'target-arrow-shape': 'triangle-backcurve',
-              'target-arrow-color': 'data(_color)',
-              'arrow-scale': 0.85,
-              'font-family': 'JetBrains Mono, monospace',
-              'font-size': 8,
-              color: '#6a675f',
-              'text-rotation': 'autorotate',
-              'text-background-color': '#0a0a0b',
-              'text-background-opacity': 1,
-              'text-background-padding': 2,
-            },
-          },
-          { selector: 'edge[type]', style: { label: 'data(type)', 'min-zoomed-font-size': 11 } },
-          { selector: 'node.t-apigw', style: { shape: 'round-rectangle', width: 36, height: 22, 'font-size': 9 } },
-        ] as any),
-        layout: {
-          name: 'cose',
-          animate: false,
-          randomize: true,
-          idealEdgeLength: 90,
-          nodeRepulsion: 9000,
-          edgeElasticity: 80,
-          gravity: 0.4,
-          numIter: 2200,
-          nestingFactor: 1.4,
-          componentSpacing: 100,
-          padding: 30,
-          fit: true,
-        },
+        style: buildStyle(),
       })
 
       cyRef.current = cy
       onCyReady?.(cy)
 
-      // Update legend counts
-      const counts: Record<string, number> = { STATIC: 0, OBSERVED: 0, INFERRED: 0 }
-      data.edges.forEach((e) => {
-        const vp = visualProv(e.provenance)
-        counts[vp] = (counts[vp] ?? 0) + 1
-      })
-      const ctStatic = document.getElementById('ct-static')
-      const ctObserved = document.getElementById('ct-observed')
-      const ctInferred = document.getElementById('ct-inferred')
-      if (ctStatic) ctStatic.textContent = String(counts.STATIC)
-      if (ctObserved) ctObserved.textContent = String(counts.OBSERVED)
-      if (ctInferred) ctInferred.textContent = String(counts.INFERRED)
+      // Render the initial (collapsed) view.
+      rerender(false)
+      setCrumbs(
+        [...expandedRef.current].map((id) => {
+          const n = modelRef.current?.byId.get(id) as { name?: string } | undefined
+          return { id, name: n?.name ?? id.replace(/^service:/, '') }
+        }),
+      )
 
-      // Update canvas tag
-      const metaEl = document.querySelector('.canvas-tag .meta')
-      if (metaEl) metaEl.textContent = `live · ${data.nodes.length} nodes · ${data.edges.length} edges · cose layout`
-
-      // Selection handler
       function focusNode(id: string) {
         cy.elements().removeClass('hl dim')
         const n = cy.getElementById(id)
@@ -358,10 +424,20 @@ export function GraphCanvas({ project, selectedNodeId, onNodeSelect, onGraphLoad
         onNodeSelect(id)
       }
 
+      // Single tap selects + inspects.
       cy.on('tap', 'node', (evt: { target: { id: () => string; select: () => void } }) => {
         cy.$(':selected').unselect()
         evt.target.select()
         focusNode(evt.target.id())
+      })
+      // Double tap on a service drills in (or out if already expanded) —
+      // navigation by the grouping. Non-service nodes ignore the gesture.
+      cy.on('dbltap', 'node', (evt: { target: { id: () => string; data: (k: string) => string } }) => {
+        const id = evt.target.id()
+        const nodeType = evt.target.data('_nodeType')
+        if (nodeType !== 'ServiceNode') return
+        if (expandedRef.current.has(id)) onCollapseService(id)
+        else onExpandService(id)
       })
       cy.on('tap', (evt: { target: unknown }) => {
         if (evt.target === cy) {
@@ -370,18 +446,11 @@ export function GraphCanvas({ project, selectedNodeId, onNodeSelect, onGraphLoad
         }
       })
 
-      // Initial layout + selection
       cy.ready(() => {
         setTimeout(() => {
-          cy.fit(undefined, 40)
+          cy.fit(undefined, 50)
           if (cy.zoom() < 0.25) {
             cy.zoom({ level: 0.45, renderedPosition: { x: cy.width() / 2, y: cy.height() / 2 } })
-          }
-          // Select first service node if available
-          const first = cy.nodes('.leaf').first()
-          if (first && first.length) {
-            first.select()
-            focusNode(first.id())
           }
           drawMinimap()
         }, 80)
@@ -407,7 +476,6 @@ export function GraphCanvas({ project, selectedNodeId, onNodeSelect, onGraphLoad
         cyEl.addEventListener('wheel', wheelHandler, { passive: false, capture: true })
       }
 
-      // Minimap updates
       cy.on('viewport zoom pan render', () => requestAnimationFrame(drawMinimap))
       window.addEventListener('resize', () => requestAnimationFrame(drawMinimap))
 
@@ -428,7 +496,6 @@ export function GraphCanvas({ project, selectedNodeId, onNodeSelect, onGraphLoad
         })
       })
 
-      // Zoom controls
       const zIn = document.getElementById('z-in')
       const zOut = document.getElementById('z-out')
       const zFit = document.getElementById('z-fit')
@@ -437,73 +504,41 @@ export function GraphCanvas({ project, selectedNodeId, onNodeSelect, onGraphLoad
       if (zFit) zFit.onclick = () => cy.fit(undefined, 60)
 
       // SSE live updates, scoped to the active project (ADR-051 dual-mount).
-      // Without the project param the daemon streams the default-project bus
-      // and every other registered project's events land on the same canvas,
-      // which reads as one merged graph across projects.
       const sse = new EventSource(
         authedEventSourceUrl(`/api/events?project=${encodeURIComponent(project)}`),
       )
       sseRef.current = sse
 
-      function pushGraphUpdate() {
-        onGraphLoaded({
-          nodes: cy.nodes(':visible').map((n: { data: (k: string) => unknown }) => n.data('_raw') as GraphNode),
-          edges: cy.edges(':visible').map((e: { data: (k: string) => unknown }) => ({ id: e.data('id'), source: e.data('source'), target: e.data('target'), type: e.data('type'), provenance: e.data('provenance'), confidence: e.data('confidence') }) as GraphEdge),
-        })
+      function applyDelta(mutate: (full: GraphData) => void) {
+        const full = fullRef.current
+        mutate(full)
+        modelRef.current = buildModel(full.nodes, full.edges)
+        onGraphLoaded({ nodes: [...full.nodes], edges: [...full.edges] })
+        rerender(false)
       }
 
       sse.addEventListener('node-added', (e) => {
         const { node } = JSON.parse(e.data) as { node: GraphNode }
-        const vt = visualType(node)
-        const ts = TYPE_STYLE[vt] ?? { color: '#888', shape: 'ellipse', size: 24 }
-        cy.add({
-          data: {
-            id: node.id,
-            label: (node as { name?: string }).name ?? node.id,
-            type: vt,
-            _color: ts.color,
-            _shape: ts.shape,
-            _size: ts.size ?? 28,
-            _isCompound: COMPOUND_TYPES.has(vt),
-            _raw: node,
-          },
-          classes: `t-${vt} ${COMPOUND_TYPES.has(vt) ? 'compound' : 'leaf'}`,
+        applyDelta((full) => {
+          if (!full.nodes.some((n) => n.id === node.id)) full.nodes.push(node)
         })
-        pushGraphUpdate()
       })
       sse.addEventListener('edge-added', (e) => {
         const { edge } = JSON.parse(e.data) as { edge: GraphEdge }
-        const vp = visualProv(edge.provenance)
-        const color = provColor[vp] ?? '#888'
-        cy.add({
-          data: {
-            id: edge.id,
-            source: edge.source,
-            target: edge.target,
-            type: edgeVerb(edge.type),
-            provenance: vp,
-            _color: color,
-            _width: vp === 'INFERRED' ? 1 : vp === 'OBSERVED' ? 1.4 : 1.2,
-            _style: vp === 'INFERRED' ? 'dotted' : vp === 'OBSERVED' ? 'dashed' : 'solid',
-            _opacity: vp === 'INFERRED' ? 0.55 : vp === 'OBSERVED' ? 0.85 : 0.75,
-          },
+        applyDelta((full) => {
+          if (!full.edges.some((x) => x.id === edge.id)) full.edges.push(edge)
         })
-        pushGraphUpdate()
       })
       sse.addEventListener('node-removed', (e) => {
         const { id } = JSON.parse(e.data) as { id: string }
-        const el = cy.getElementById(id)
-        if (el && el.length) el.remove()
-        pushGraphUpdate()
+        applyDelta((full) => { full.nodes = full.nodes.filter((n) => n.id !== id) })
       })
       sse.addEventListener('edge-removed', (e) => {
         const { id } = JSON.parse(e.data) as { id: string }
-        const el = cy.getElementById(id)
-        if (el && el.length) el.remove()
-        pushGraphUpdate()
+        applyDelta((full) => { full.edges = full.edges.filter((x) => x.id !== id) })
       })
       sse.addEventListener('error', () => {
-        // pre-v0.2.8 or connection drop — ignore silently
+        // pre-v0.2.8 or connection drop — handled by StatusBar's SSE state.
       })
 
       window.__cy = cy
@@ -522,16 +557,47 @@ export function GraphCanvas({ project, selectedNodeId, onNodeSelect, onGraphLoad
         cyRef.current = null
       }
     }
+    // Re-init only when the project changes; drill state is handled by the
+    // separate [expanded] effect above so we don't tear down cytoscape on
+    // every open/close.
   }, [project])
 
   return (
     <main className="canvas-wrap">
-      <div id="cy" ref={containerRef} aria-label="Service dependency graph" role="img" />
+      <div id="cy" ref={containerRef} aria-label="File-first dependency graph" role="img" />
 
       <div className="canvas-tag">
         <span className="title">NEAT</span>
         <span className="meta">loading…</span>
       </div>
+
+      {/* Drill breadcrumb — navigation by the grouping. Top → service → … */}
+      <nav className="drill-crumbs" aria-label="Drill-down navigation">
+        <button
+          className={`drill-crumb${crumbs.length === 0 ? ' current' : ''}`}
+          onClick={onCollapseAll}
+          disabled={crumbs.length === 0}
+          aria-label="Top view — all services collapsed"
+        >
+          all services
+        </button>
+        {crumbs.map((c) => (
+          <span key={c.id} style={{ display: 'inline-flex', alignItems: 'center', gap: 10 }}>
+            <span className="drill-crumb-sep">›</span>
+            <button
+              className="drill-crumb current"
+              onClick={() => onCollapseService(c.id)}
+              title={`Collapse ${c.name}`}
+              aria-label={`${c.name} expanded — click to collapse`}
+            >
+              {c.name}
+            </button>
+          </span>
+        ))}
+        <span className="drill-hint">
+          {crumbs.length === 0 ? 'double-click a service to open its files' : 'double-click to collapse'}
+        </span>
+      </nav>
 
       <div className="canvas-toolbar">
         <button
@@ -548,7 +614,7 @@ export function GraphCanvas({ project, selectedNodeId, onNodeSelect, onGraphLoad
           Locked
         </button>
         <span className="div" />
-        <button onClick={() => cyRef.current?.fit(undefined, 40)}>Fit</button>
+        <button onClick={() => cyRef.current?.fit(undefined, 50)}>Fit</button>
         <button onClick={() => cyRef.current?.center()}>Center</button>
         <span className="div" />
         <button onClick={() => cyRef.current?.layout({ name: 'cose', animate: true, randomize: false, idealEdgeLength: 90, nodeRepulsion: 9000, edgeElasticity: 80, gravity: 0.4, numIter: 1200 }).run()}>
@@ -565,8 +631,8 @@ export function GraphCanvas({ project, selectedNodeId, onNodeSelect, onGraphLoad
       <aside className="legend" id="legend">
         <h4>Edge provenance</h4>
         <div className="legend-row" data-prov="STATIC">
-          <span className="swatch" style={{ background: 'var(--prov-static)' }} />
-          <span className="name">Static</span>
+          <span className="swatch" />
+          <span className="name">Extracted</span>
           <span className="ct mono" id="ct-static">—</span>
         </div>
         <div className="legend-row" data-prov="OBSERVED">
@@ -584,14 +650,9 @@ export function GraphCanvas({ project, selectedNodeId, onNodeSelect, onGraphLoad
 
         <h4 style={{ marginTop: 0 }}>Node kind</h4>
         <div className="nodes-grid">
-          {[
-            ['service', '--n-service'], ['db', '--n-db'], ['cache', '--n-cache'],
-            ['stream', '--n-stream'], ['lambda', '--n-lambda'], ['cron', '--n-cron'],
-            ['api', '--n-api'], ['compute', '--n-compute'], ['storage', '--n-storage'],
-            ['external', '--n-external'],
-          ].map(([label, v]) => (
-            <div key={label} className="nrow">
-              <span className="nsq" style={{ background: `var(${v})` }} />
+          {GLYPH_LEGEND.map(({ kind, label }) => (
+            <div key={kind} className="nrow">
+              <KindGlyph kind={kind} />
               {label}
             </div>
           ))}
@@ -604,6 +665,27 @@ export function GraphCanvas({ project, selectedNodeId, onNodeSelect, onGraphLoad
         <div className="frame" id="minimap-frame" ref={minimapFrameRef} />
       </div>
     </main>
+  )
+}
+
+// Inline glyph for the legend — kept local so the legend's shape vocabulary
+// matches the canvas exactly. Filled square = file (primary node).
+function KindGlyph({ kind }: { kind: string }) {
+  const filled = kind === 'file'
+  let inner: React.ReactNode
+  switch (kind) {
+    case 'file': inner = <rect x="1.5" y="1.5" width="9" height="9" />; break
+    case 'service': inner = <polygon points="6,0.5 11,3.25 11,8.75 6,11.5 1,8.75 1,3.25" strokeLinejoin="round" />; break
+    case 'db': inner = <circle cx="6" cy="6" r="5" />; break
+    case 'storage': inner = <rect x="1" y="2.5" width="10" height="7" />; break
+    case 'external': inner = <polygon points="6,0.5 11.5,4.3 9.4,11 2.6,11 0.5,4.3" strokeLinejoin="round" />; break
+    case 'compute': inner = <polygon points="6,0.5 11.5,6 6,11.5 0.5,6" strokeLinejoin="round" />; break
+    default: inner = <circle cx="6" cy="6" r="5" />
+  }
+  return (
+    <svg className={`glyph${filled ? ' filled' : ''}`} viewBox="0 0 12 12" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+      {inner}
+    </svg>
   )
 }
 

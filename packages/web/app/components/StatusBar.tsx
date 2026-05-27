@@ -63,9 +63,11 @@ export function EnvironmentIndicator() {
 
   const local = isLocalHost(hostname)
   const label = local ? 'local' : `remote · ${hostname}`
-  const bg = local ? 'rgba(95,207,158,0.18)' : 'rgba(216,165,84,0.20)'
-  const fg = local ? 'var(--prov-observed)' : '#d8a554'
-  const border = local ? 'rgba(95,207,158,0.35)' : 'rgba(216,165,84,0.45)'
+  // Local is the one live accent (green); remote stays monochrome on the
+  // black surface — a hollow white-ruled chip rather than amber-gold.
+  const bg = local ? 'rgba(95,207,158,0.16)' : 'transparent'
+  const fg = local ? 'var(--prov-observed)' : 'var(--fg)'
+  const border = local ? 'rgba(95,207,158,0.4)' : 'var(--rule)'
 
   return (
     <div className="st-item" data-env-state={local ? 'local' : 'remote'}>
@@ -146,7 +148,7 @@ export function SignOutButton() {
         title="Clear the bearer token and return to the login screen"
         style={{
           background: 'rgba(255,255,255,0.04)',
-          color: 'var(--paper-3)',
+          color: 'var(--fg-muted)',
           border: '1px solid var(--rule)',
           borderRadius: 999,
           padding: '1px 8px',

@@ -69,7 +69,7 @@ export function IncidentsClient() {
   }, [project])
 
   return (
-    <div style={{ background: 'var(--ink-0)', minHeight: '100vh' }}>
+    <div style={{ background: 'var(--bg)', minHeight: '100vh' }}>
       <header className="topbar">
         <div className="brand" title="NEAT">N</div>
         <div className="crumbs">

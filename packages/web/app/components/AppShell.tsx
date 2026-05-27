@@ -42,6 +42,11 @@ export function AppShell() {
   useAuthGate()
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null)
   const [graphData, setGraphData] = useState<GraphData | null>(null)
+  // file-awareness §2/§3 — drill-down navigates by the grouping. `expanded`
+  // is the set of service ids the operator has opened to reveal their files
+  // via CONTAINS. Empty = top view (all services collapsed). AppShell owns it
+  // so the canvas and the breadcrumb share one source of truth.
+  const [expanded, setExpanded] = useState<Set<string>>(new Set())
   // ADR-057 #2 — start with URL or localStorage (synchronous), then resolve
   // against /projects on mount if neither was set. Safe because AppShell
   // mounts client-only via dynamic({ ssr: false }) in app/page.tsx (ADR-062).
@@ -94,6 +99,26 @@ export function AppShell() {
     if (nodeId) setSelectedNodeId(nodeId)
   }, [])
 
+  // Drill into a service: reveal its files via CONTAINS. Drill back out:
+  // collapse it. Navigation by the grouping — never a rollup.
+  function expandService(serviceId: string): void {
+    setExpanded((prev) => {
+      const next = new Set(prev)
+      next.add(serviceId)
+      return next
+    })
+  }
+  function collapseService(serviceId: string): void {
+    setExpanded((prev) => {
+      const next = new Set(prev)
+      next.delete(serviceId)
+      return next
+    })
+  }
+  function collapseAll(): void {
+    setExpanded(new Set())
+  }
+
   // ADR-058 #4 — Ctrl+Shift+D / Cmd+Shift+D toggles the debug panel.
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
@@ -122,8 +147,18 @@ export function AppShell() {
         onNodeSelect={setSelectedNodeId}
         onGraphLoaded={setGraphData}
         onCyReady={(cy) => { cyRef.current = cy }}
+        expanded={expanded}
+        onExpandService={expandService}
+        onCollapseService={collapseService}
+        onCollapseAll={collapseAll}
       />
-      <Inspector project={project} selectedNodeId={selectedNodeId} graphData={graphData} />
+      <Inspector
+        project={project}
+        selectedNodeId={selectedNodeId}
+        graphData={graphData}
+        onNodeSelect={setSelectedNodeId}
+        onExpandService={expandService}
+      />
       <StatusBar project={project} graphData={graphData} />
       <Toaster />
       {debugOpen && <DebugPanel project={project} onClose={() => setDebugOpen(false)} />}

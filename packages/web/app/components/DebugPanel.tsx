@@ -47,38 +47,39 @@ export function DebugPanel({ project, onClose }: DebugPanelProps) {
       aria-label="Debug panel"
       style={{
         position: 'fixed',
-        top: 60,
-        right: 16,
+        top: 72,
+        right: 20,
         width: 420,
         maxHeight: '70vh',
         overflow: 'auto',
-        background: 'var(--ink-2, #14141a)',
-        border: '1px solid var(--rule, #2a2a30)',
-        color: 'var(--paper-1, #d8d3c9)',
-        fontFamily: 'JetBrains Mono, monospace',
+        background: 'var(--bg, #000)',
+        border: '1px solid var(--rule, #333)',
+        color: 'var(--fg, #fff)',
+        fontFamily: 'var(--font-mono, monospace)',
         fontSize: 11,
-        padding: 12,
+        letterSpacing: '0.02em',
+        padding: 16,
         zIndex: 1000,
-        boxShadow: '0 16px 40px rgba(0,0,0,0.45)',
+        boxShadow: '0 16px 40px rgba(0,0,0,0.6)',
       }}
     >
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 8 }}>
-        <strong style={{ fontFamily: 'Spectral, serif', fontStyle: 'italic' }}>NEAT debug</strong>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 14 }}>
+        <strong style={{ fontFamily: 'var(--font-mono, monospace)', fontWeight: 400, fontSize: '0.62rem', letterSpacing: '0.14em', textTransform: 'uppercase', color: 'var(--fg-muted)' }}>NEAT debug</strong>
         <button onClick={onClose} aria-label="Close debug panel" title="Close (Ctrl+Shift+D)" style={{ background: 'transparent', border: 'none', color: 'inherit', cursor: 'pointer', fontSize: 14 }}>×</button>
       </div>
 
-      <section style={{ marginBottom: 10 }}>
-        <div style={{ color: 'var(--paper-3)', marginBottom: 4 }}>environment</div>
+      <section style={{ marginBottom: 14 }}>
+        <div style={{ color: 'var(--fg-muted)', marginBottom: 6, fontSize: '0.55rem', letterSpacing: '0.14em', textTransform: 'uppercase' }}>environment</div>
         <div>project: <code>{project}</code></div>
         <div>NEAT_API_URL: <code>{CORE_URL_PUBLIC}</code></div>
       </section>
 
       <section style={{ marginBottom: 10 }}>
-        <div style={{ color: 'var(--paper-3)', marginBottom: 4 }}>last {calls.length} api calls</div>
+        <div style={{ color: 'var(--fg-muted)', marginBottom: 6, fontSize: '0.55rem', letterSpacing: '0.14em', textTransform: 'uppercase' }}>last {calls.length} api calls</div>
         {calls.length === 0 && <div style={{ opacity: 0.5 }}>none yet</div>}
         {calls.map((c, i) => (
           <div key={i} style={{ display: 'flex', gap: 8, lineHeight: 1.5 }}>
-            <span style={{ width: 36, color: c.status >= 400 ? '#e87a7a' : c.status === 0 ? '#d3a847' : 'var(--paper-2)' }}>{c.status || '—'}</span>
+            <span style={{ width: 36, color: c.status >= 400 ? '#e08a8a' : c.status === 0 ? 'var(--fg-muted)' : 'var(--fg)' }}>{c.status || '—'}</span>
             <span style={{ width: 50, opacity: 0.6 }}>{c.durationMs}ms</span>
             <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{c.path}</span>
           </div>
@@ -86,7 +87,7 @@ export function DebugPanel({ project, onClose }: DebugPanelProps) {
       </section>
 
       <section style={{ marginBottom: 10 }}>
-        <div style={{ color: 'var(--paper-3)', marginBottom: 4 }}>last {sseEvents.length} sse events</div>
+        <div style={{ color: 'var(--fg-muted)', marginBottom: 6, fontSize: '0.55rem', letterSpacing: '0.14em', textTransform: 'uppercase' }}>last {sseEvents.length} sse events</div>
         {sseEvents.length === 0 && <div style={{ opacity: 0.5 }}>none yet</div>}
         {sseEvents.map((e, i) => (
           <div key={i} style={{ display: 'flex', gap: 8 }}>
@@ -97,7 +98,7 @@ export function DebugPanel({ project, onClose }: DebugPanelProps) {
       </section>
 
       <section>
-        <div style={{ color: 'var(--paper-3)', marginBottom: 4 }}>heartbeats</div>
+        <div style={{ color: 'var(--fg-muted)', marginBottom: 6, fontSize: '0.55rem', letterSpacing: '0.14em', textTransform: 'uppercase' }}>heartbeats</div>
         {heartbeats.length === 0 && <div style={{ opacity: 0.5 }}>none yet</div>}
         {heartbeats.map((h, i) => (
           <div key={i} style={{ display: 'flex', gap: 8 }}>
