@@ -36,23 +36,24 @@ export function Toaster() {
       }}
     >
       {toasts.map((t) => {
-        const color = t.level === 'error' ? '#e87a7a' : t.level === 'warn' ? '#d3a847' : 'var(--prov-observed)'
+        const color = t.level === 'error' ? '#e08a8a' : t.level === 'warn' ? 'var(--fg)' : 'var(--prov-observed)'
         return (
           <div
             key={t.id}
             className="toast"
             onClick={() => setToasts((prev) => prev.filter((p) => p.id !== t.id))}
             style={{
-              background: 'var(--ink-2, #14141a)',
-              border: `1px solid ${color}`,
-              borderLeft: `3px solid ${color}`,
-              padding: '8px 12px',
-              fontFamily: 'JetBrains Mono, monospace',
+              background: 'var(--bg, #000)',
+              border: `1px solid var(--rule)`,
+              borderLeft: `2px solid ${color}`,
+              padding: '10px 14px',
+              fontFamily: 'var(--font-mono, monospace)',
               fontSize: 11,
-              color: 'var(--paper-1, #d8d3c9)',
+              letterSpacing: '0.02em',
+              color: 'var(--fg, #fff)',
               maxWidth: 360,
               cursor: 'pointer',
-              boxShadow: '0 8px 16px rgba(0,0,0,0.35)',
+              boxShadow: '0 8px 24px rgba(0,0,0,0.6)',
             }}
           >
             <div style={{ display: 'flex', gap: 8, alignItems: 'baseline' }}>
