@@ -7214,12 +7214,15 @@ describe('Web shell multi-project routing (ADR-057)', () => {
     expect(src).toMatch(/localStorage[\s\S]*?neat:lastProject/)
   })
 
-  it('AppShell.tsx falls back to first entry from GET /projects when registry is non-empty (ADR-057 #2.3)', () => {
+  it('AppShell.tsx resolves to the first active project from GET /projects, skipping broken/paused (ADR-057 #2.3, web-multi-project §2.3)', () => {
     const src = readSrc(APP_SHELL)
     // `authedFetch` from ADR-073 §3 is also acceptable — it's a thin wrapper
     // around `fetch` that attaches the bearer when one is in storage.
     expect(src).toMatch(/(authed)?[Ff]etch\(['"]\/api\/projects['"]\)/)
-    expect(src).toMatch(/list\[0\]/)
+    // Resolution is a pure, unit-testable selector that prefers an active
+    // project so the dashboard never opens onto a broken/paused one (#419).
+    expect(src).toMatch(/resolveProjectFromList/)
+    expect(src).toMatch(/status\s*===\s*['"]active['"]/)
   })
 
   it('AppShell.tsx falls back to "default" when registry is empty (ADR-057 #2.4)', () => {
