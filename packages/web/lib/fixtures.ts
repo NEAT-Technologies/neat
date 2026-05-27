@@ -1,26 +1,50 @@
 // Fixture data returned when NEAT_DEMO=1 and core is unreachable.
-// Represents a realistic microservices graph for standalone frontend dev.
+// File-first graph (file-awareness.md §1-§3): FileNodes are the primary
+// nodes, CALLS edges originate from files, and `service ──CONTAINS──▶ file`
+// expresses ownership. CONNECTS_TO to databases/infra also originates from
+// the file that opens the connection. The dashboard collapses services by
+// default and expands to these files on drill-down.
 
 export const FIXTURE_GRAPH = {
   nodes: [
+    // services — collapsed containers in the top view
     { id: 'service:checkout', type: 'ServiceNode', name: 'checkout', language: 'TypeScript', version: '2.4.1' },
-    { id: 'service:payments', type: 'ServiceNode', name: 'payments', language: 'Go', version: '1.2.0' },
+    { id: 'service:payments', type: 'ServiceNode', name: 'payments', language: 'TypeScript', version: '1.2.0' },
     { id: 'service:auth', type: 'ServiceNode', name: 'auth', language: 'TypeScript', version: '3.0.0' },
-    { id: 'service:api-gateway', type: 'ServiceNode', name: 'api/gateway', language: 'TypeScript', version: '1.0.5' },
+    { id: 'service:api-gateway', type: 'ServiceNode', name: 'api-gateway', language: 'TypeScript', version: '1.0.5' },
     { id: 'service:notifications', type: 'ServiceNode', name: 'notifications', language: 'Python', version: '1.1.0' },
-    { id: 'database:payments-db.internal', type: 'DatabaseNode', name: 'payments-db', host: 'payments-db.internal', port: '5432', engine: 'postgresql', engineVersion: '15.2' },
-    { id: 'database:auth-db.internal', type: 'DatabaseNode', name: 'auth-db', host: 'auth-db.internal', port: '5432', engine: 'postgresql', engineVersion: '14.8' },
-    { id: 'infra:redis:cache.internal', type: 'InfraNode', name: 'cache', kind: 'cache', host: 'cache.internal', port: '6379' },
+    // files — revealed when a service is opened
+    { id: 'file:checkout:src/routes/charge.ts', type: 'FileNode', service: 'checkout', path: 'src/routes/charge.ts', language: 'ts' },
+    { id: 'file:checkout:src/lib/cache.ts', type: 'FileNode', service: 'checkout', path: 'src/lib/cache.ts', language: 'ts' },
+    { id: 'file:checkout:src/notify.ts', type: 'FileNode', service: 'checkout', path: 'src/notify.ts', language: 'ts' },
+    { id: 'file:payments:src/db.ts', type: 'FileNode', service: 'payments', path: 'src/db.ts', language: 'ts' },
+    { id: 'file:auth:src/token.ts', type: 'FileNode', service: 'auth', path: 'src/token.ts', language: 'ts' },
+    { id: 'file:auth:src/db.ts', type: 'FileNode', service: 'auth', path: 'src/db.ts', language: 'ts' },
+    { id: 'file:api-gateway:src/proxy.ts', type: 'FileNode', service: 'api-gateway', path: 'src/proxy.ts', language: 'ts' },
+    // datastores + infra
+    { id: 'database:payments-db.internal', type: 'DatabaseNode', name: 'payments-db', host: 'payments-db.internal', port: 5432, engine: 'postgresql', engineVersion: '15.2', compatibleDrivers: [] },
+    { id: 'database:auth-db.internal', type: 'DatabaseNode', name: 'auth-db', host: 'auth-db.internal', port: 5432, engine: 'postgresql', engineVersion: '14.8', compatibleDrivers: [] },
+    { id: 'infra:redis:cache.internal', type: 'InfraNode', name: 'cache', kind: 'cache', provider: 'redis' },
   ],
   edges: [
-    { id: 'CALLS:OBSERVED:service:api-gateway->service:checkout', source: 'service:api-gateway', target: 'service:checkout', type: 'CALLS', provenance: 'OBSERVED', confidence: 1.0, callCount: 42891 },
-    { id: 'CALLS:OBSERVED:service:api-gateway->service:auth', source: 'service:api-gateway', target: 'service:auth', type: 'CALLS', provenance: 'OBSERVED', confidence: 1.0, callCount: 18204 },
-    { id: 'CALLS:OBSERVED:service:checkout->service:payments', source: 'service:checkout', target: 'service:payments', type: 'CALLS', provenance: 'OBSERVED', confidence: 1.0, callCount: 9341 },
-    { id: 'CALLS:EXTRACTED:service:checkout->service:notifications', source: 'service:checkout', target: 'service:notifications', type: 'CALLS', provenance: 'EXTRACTED', confidence: 0.9 },
-    { id: 'CONNECTS_TO:OBSERVED:service:payments->database:payments-db.internal', source: 'service:payments', target: 'database:payments-db.internal', type: 'CONNECTS_TO', provenance: 'OBSERVED', confidence: 1.0 },
-    { id: 'CONNECTS_TO:EXTRACTED:service:auth->database:auth-db.internal', source: 'service:auth', target: 'database:auth-db.internal', type: 'CONNECTS_TO', provenance: 'EXTRACTED', confidence: 0.95 },
-    { id: 'CONNECTS_TO:INFERRED:service:checkout->infra:redis:cache.internal', source: 'service:checkout', target: 'infra:redis:cache.internal', type: 'CONNECTS_TO', provenance: 'INFERRED', confidence: 0.6 },
-    { id: 'CONNECTS_TO:INFERRED:service:auth->infra:redis:cache.internal', source: 'service:auth', target: 'infra:redis:cache.internal', type: 'CONNECTS_TO', provenance: 'INFERRED', confidence: 0.6 },
+    // service ──CONTAINS──▶ file (structural ownership, not traffic)
+    { id: 'CONTAINS:checkout->charge', source: 'service:checkout', target: 'file:checkout:src/routes/charge.ts', type: 'CONTAINS', provenance: 'EXTRACTED', confidence: 1.0 },
+    { id: 'CONTAINS:checkout->cache', source: 'service:checkout', target: 'file:checkout:src/lib/cache.ts', type: 'CONTAINS', provenance: 'EXTRACTED', confidence: 1.0 },
+    { id: 'CONTAINS:checkout->notify', source: 'service:checkout', target: 'file:checkout:src/notify.ts', type: 'CONTAINS', provenance: 'EXTRACTED', confidence: 1.0 },
+    { id: 'CONTAINS:payments->db', source: 'service:payments', target: 'file:payments:src/db.ts', type: 'CONTAINS', provenance: 'EXTRACTED', confidence: 1.0 },
+    { id: 'CONTAINS:auth->token', source: 'service:auth', target: 'file:auth:src/token.ts', type: 'CONTAINS', provenance: 'EXTRACTED', confidence: 1.0 },
+    { id: 'CONTAINS:auth->db', source: 'service:auth', target: 'file:auth:src/db.ts', type: 'CONTAINS', provenance: 'EXTRACTED', confidence: 1.0 },
+    { id: 'CONTAINS:gw->proxy', source: 'service:api-gateway', target: 'file:api-gateway:src/proxy.ts', type: 'CONTAINS', provenance: 'EXTRACTED', confidence: 1.0 },
+    // CALLS originate from files, with file:line evidence
+    { id: 'CALLS:OBSERVED:gw-proxy->charge', source: 'file:api-gateway:src/proxy.ts', target: 'file:checkout:src/routes/charge.ts', type: 'CALLS', provenance: 'OBSERVED', confidence: 0.98, callCount: 42891, evidence: { file: 'src/proxy.ts', line: 64 }, signal: { spanCount: 42891, errorCount: 12 } },
+    { id: 'CALLS:OBSERVED:gw-proxy->token', source: 'file:api-gateway:src/proxy.ts', target: 'file:auth:src/token.ts', type: 'CALLS', provenance: 'OBSERVED', confidence: 0.97, callCount: 18204, evidence: { file: 'src/proxy.ts', line: 81 }, signal: { spanCount: 18204, errorCount: 3 } },
+    { id: 'CALLS:OBSERVED:charge->payments-db', source: 'file:checkout:src/routes/charge.ts', target: 'file:payments:src/db.ts', type: 'CALLS', provenance: 'OBSERVED', confidence: 0.95, callCount: 9341, evidence: { file: 'src/routes/charge.ts', line: 118 }, signal: { spanCount: 9341, errorCount: 421 } },
+    { id: 'CALLS:EXTRACTED:notify->notifications', source: 'file:checkout:src/notify.ts', target: 'service:notifications', type: 'CALLS', provenance: 'EXTRACTED', confidence: 0.9, evidence: { file: 'src/notify.ts', line: 22 } },
+    // connections to datastores + infra, file-grained
+    { id: 'CONNECTS_TO:OBSERVED:payments-db->pg', source: 'file:payments:src/db.ts', target: 'database:payments-db.internal', type: 'CONNECTS_TO', provenance: 'OBSERVED', confidence: 1.0, evidence: { file: 'src/db.ts', line: 9 } },
+    { id: 'CONNECTS_TO:EXTRACTED:auth-db->pg', source: 'file:auth:src/db.ts', target: 'database:auth-db.internal', type: 'CONNECTS_TO', provenance: 'EXTRACTED', confidence: 0.95, evidence: { file: 'src/db.ts', line: 11 } },
+    { id: 'CONNECTS_TO:INFERRED:checkout-cache->redis', source: 'file:checkout:src/lib/cache.ts', target: 'infra:redis:cache.internal', type: 'CONNECTS_TO', provenance: 'INFERRED', confidence: 0.6 },
+    { id: 'CONNECTS_TO:INFERRED:auth-token->redis', source: 'file:auth:src/token.ts', target: 'infra:redis:cache.internal', type: 'CONNECTS_TO', provenance: 'INFERRED', confidence: 0.6 },
   ],
 }
 
@@ -58,11 +82,17 @@ export const FIXTURE_PROJECTS = [
 
 export const FIXTURE_VIOLATIONS = { violations: [] }
 
+// A node's searchable / display name. FileNodes carry `path` rather than
+// `name`, so fall back to it (then to the id) — keeps search file-aware.
+function fixtureNodeLabel(n: { name?: string; path?: string; id: string }): string {
+  return n.name ?? n.path ?? n.id
+}
+
 export function fixtureSearch(q: string) {
   const lower = q.toLowerCase()
   const results = FIXTURE_GRAPH.nodes
-    .filter((n) => n.name.toLowerCase().includes(lower) || n.id.toLowerCase().includes(lower))
-    .map((n) => ({ node: { id: n.id, type: n.type, name: n.name }, score: 0.95 }))
+    .filter((n) => fixtureNodeLabel(n).toLowerCase().includes(lower) || n.id.toLowerCase().includes(lower))
+    .map((n) => ({ node: { id: n.id, type: n.type, name: fixtureNodeLabel(n) }, score: 0.95 }))
   return { results }
 }
 
