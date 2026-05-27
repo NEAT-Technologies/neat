@@ -37,10 +37,20 @@ In order, first non-empty wins:
 
 1. URL query param: `?project=X`
 2. `localStorage.getItem('neat:lastProject')` — survives reload
-3. First entry from `GET /projects` if registry is non-empty
+3. First **active** entry from `GET /projects` (rule 2.3 below)
 4. `'default'` fallback (only allowed value of `'default'` in branching logic)
 
 Steps 1-2 run synchronously inside the `useState` lazy initializer; step 3 is async and runs from a `useEffect` after mount only when steps 1-2 produced no value. AppShell is rendered client-only (see rule 2a below), so the synchronous reads are safe — no server-side execution to disagree with.
+
+### 2.3 Step 3 is health-aware
+
+The `/projects` payload carries a `status` per ADR-051 (`'active' | 'paused' | 'broken'`). Step 3 must not blindly take `list[0]` — a `broken` (dead path) or `paused` project resolves to an empty/erroring graph and blanks the dashboard (#419). Resolution within step 3:
+
+1. First project whose `status` is `'active'`.
+2. If none are active, the first project with a name (so a single non-active registered project still beats `'default'`).
+3. Only if the list is empty (or the registry is unreachable), `'default'`.
+
+The selector is a pure function (`resolveProjectFromList` in `AppShell.tsx`) so it can be unit-tested directly without rendering.
 
 ### 2a. Client-only render boundaries (ADR-062 + 2026-05-11 amendment, supersedes the SSR-safety amendment to ADR-057)
 

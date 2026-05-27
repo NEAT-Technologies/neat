@@ -1,4 +1,10 @@
-export const CORE_URL = process.env.NEAT_CORE_URL ?? 'http://localhost:8080'
+// web-bootstrap §6 — neatd's spawnWebUI sets NEAT_API_URL in the child's env,
+// pointing at the daemon that launched it. The proxy routes must read the same
+// name, or a non-default PORT lands us back on :8080 (the old NEAT_CORE_URL
+// mismatch, #418). NEAT_CORE_URL stays as a deprecated fallback so operators
+// who set it by hand don't break on upgrade.
+export const CORE_URL =
+  process.env.NEAT_API_URL ?? process.env.NEAT_CORE_URL ?? 'http://localhost:8080'
 export const DEMO = process.env.NEAT_DEMO === '1'
 
 // Forward the operator's bearer (ADR-073 §3) and the SSE caller's Last-Event-ID

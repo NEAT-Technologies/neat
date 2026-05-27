@@ -17,7 +17,21 @@ export interface GraphData {
   edges: GraphEdge[]
 }
 
-interface ProjectEntry { name: string }
+// The /projects payload carries a status per ADR-051. 'active' is the healthy
+// state; 'broken' (dead path) and 'paused' both yield an empty/erroring graph.
+interface ProjectEntry { name: string; status?: 'active' | 'paused' | 'broken' }
+
+// web-multi-project §2.3 — pick the project to land on when neither the URL
+// nor localStorage named one. Prefer the first *active* project so we never
+// open onto a broken/paused one and blank the dashboard (#419). If none are
+// active, fall back to the first available project, then to 'default' (§2.4).
+export function resolveProjectFromList(list: ProjectEntry[]): string {
+  const active = list.find((p) => p?.name && p.status === 'active')
+  if (active?.name) return active.name
+  const firstNamed = list.find((p) => p?.name)
+  if (firstNamed?.name) return firstNamed.name
+  return 'default'
+}
 
 // ADR-057 #2 — resolution chain. URL → localStorage → first /projects → 'default'.
 function readUrlProject(): string | null {
@@ -72,8 +86,10 @@ export function AppShell() {
     window.history.replaceState({}, '', url)
   }
 
-  // ADR-057 #2.3, #2.4 — if neither URL nor localStorage gave us a project,
-  // fetch /projects and use the first entry; fall back to 'default' if empty.
+  // ADR-057 #2.3, #2.4 / web-multi-project §2.3 — if neither URL nor
+  // localStorage gave us a project, fetch /projects and resolve to the first
+  // *active* one (skip broken/paused so we don't open onto an empty graph,
+  // #419); fall back to the first available, then to 'default' if empty.
   useEffect(() => {
     if (resolvedRef.current) return
     resolvedRef.current = true
@@ -81,11 +97,7 @@ export function AppShell() {
       .then((r) => (r.ok ? r.json() : []))
       .then((data: ProjectEntry[] | { projects?: ProjectEntry[] }) => {
         const list = Array.isArray(data) ? data : Array.isArray(data?.projects) ? data.projects : []
-        if (list.length > 0 && list[0]?.name) {
-          setProject(list[0].name)
-        } else {
-          setProject('default')
-        }
+        setProject(resolveProjectFromList(list))
       })
       .catch(() => {
         /* registry unreachable — keep 'default' fallback */
