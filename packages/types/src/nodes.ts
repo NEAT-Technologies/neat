@@ -150,6 +150,11 @@ export const FileNodeSchema = z.object({
   path: z.string(),
   language: z.string().optional(),
   discoveredVia: DiscoveredViaSchema.optional(),
+  // The raw compiled `dist/...js` frame an OBSERVED call site was captured on,
+  // preserved for diagnostic when ingest resolved it through a source map to
+  // this original `src/...ts` (file-awareness.md §4 / `code.original_filepath`).
+  // Absent when the call site was already source-grained.
+  originalPath: z.string().optional(),
 })
 export type FileNode = z.infer<typeof FileNodeSchema>
 

@@ -1,5 +1,6 @@
-import { promises as fs } from 'node:fs'
+import { promises as fs, existsSync, readFileSync } from 'node:fs'
 import path from 'node:path'
+import * as sourceMapJs from 'source-map-js'
 import type {
   DatabaseNode,
   ErrorEvent,
@@ -235,6 +236,61 @@ interface CallSite {
   relPath: string
   line?: number
   fn?: string
+  // The service-relative dist path the call site was captured on, when ingest
+  // resolved it through a source map to a different (source) `relPath`
+  // (file-awareness.md §4). Surfaces as FileNode.originalPath. Absent when the
+  // captured frame was already source-grained.
+  originalRelPath?: string
+}
+
+// dist→src source-map resolution (file-awareness.md §4). A runtime call site in
+// a compiled `dist/...js` is resolved through a disk-adjacent `.map` to the
+// original `src/...ts`, so an OBSERVED edge lands on the source file an agent
+// can open. Same-host only — when the daemon's filesystem doesn't carry the map
+// (a service that ran on a different machine) the dist frame is kept, honestly,
+// never fabricated (§6). Each dist file is read from disk once: a present map
+// caches its consumer, an absent one caches `null`. Synchronous reads keep
+// callSiteFromSpan synchronous; the cost is amortised across a file's spans.
+const sourceMapCache = new Map<
+  string,
+  { consumer: sourceMapJs.SourceMapConsumer; dir: string } | null
+>()
+
+interface ResolvedSrc {
+  filepath: string
+  line?: number
+}
+
+function resolveDistToSrc(absFilepath: string, line?: number): ResolvedSrc | null {
+  if (!absFilepath.endsWith('.js')) return null
+  let entry = sourceMapCache.get(absFilepath)
+  if (entry === undefined) {
+    entry = null
+    const mapPath = `${absFilepath}.map`
+    try {
+      if (existsSync(mapPath)) {
+        const raw = JSON.parse(readFileSync(mapPath, 'utf8')) as unknown
+        const consumer = new sourceMapJs.SourceMapConsumer(raw as never)
+        entry = { consumer, dir: path.dirname(mapPath) }
+      }
+    } catch {
+      entry = null
+    }
+    sourceMapCache.set(absFilepath, entry)
+  }
+  if (!entry) return null
+  try {
+    const pos = entry.consumer.originalPositionFor({
+      line: line !== undefined && Number.isFinite(line) ? line : 1,
+      column: 0,
+    })
+    if (!pos || !pos.source) return null
+    const root = entry.consumer.sourceRoot ?? ''
+    const resolved = path.resolve(entry.dir, root, pos.source)
+    return { filepath: resolved, ...(pos.line ? { line: pos.line } : {}) }
+  } catch {
+    return null
+  }
 }
 
 // Read the call-site attributes off a span. Returns null when the span carries
@@ -243,14 +299,30 @@ interface CallSite {
 function callSiteFromSpan(span: ParsedSpan, serviceNode?: ServiceNode): CallSite | null {
   const filepath = span.attributes[CODE_FILEPATH_ATTR]
   if (typeof filepath !== 'string' || filepath.length === 0) return null
-  const relPath = relPathForRuntimeFile(filepath, serviceNode)
-  if (!relPath) return null
   const linenoRaw = span.attributes[CODE_LINENO_ATTR]
-  const line =
+  let line =
     typeof linenoRaw === 'number' && Number.isFinite(linenoRaw) ? linenoRaw : undefined
+  // Resolve a compiled dist frame to its source before computing the service-
+  // relative path, so the FileNode lands on the original `src/...ts`.
+  const abs = toPosix(filepath).replace(/^file:\/\//, '')
+  const resolved = resolveDistToSrc(abs, line)
+  let effectivePath = filepath
+  let originalRelPath: string | undefined
+  if (resolved) {
+    originalRelPath = relPathForRuntimeFile(filepath, serviceNode) ?? undefined
+    effectivePath = resolved.filepath
+    if (resolved.line !== undefined) line = resolved.line
+  }
+  const relPath = relPathForRuntimeFile(effectivePath, serviceNode)
+  if (!relPath) return null
   const fnRaw = span.attributes[CODE_FUNCTION_ATTR]
   const fn = typeof fnRaw === 'string' && fnRaw.length > 0 ? fnRaw : undefined
-  return { relPath, ...(line !== undefined ? { line } : {}), ...(fn ? { fn } : {}) }
+  return {
+    relPath,
+    ...(line !== undefined ? { line } : {}),
+    ...(fn ? { fn } : {}),
+    ...(originalRelPath && originalRelPath !== relPath ? { originalRelPath } : {}),
+  }
 }
 
 // Ensure the FileNode for an observed call site and the owning service's
@@ -275,6 +347,7 @@ function ensureObservedFileNode(
       service: serviceName,
       path: callSite.relPath,
       ...(language ? { language } : {}),
+      ...(callSite.originalRelPath ? { originalPath: callSite.originalRelPath } : {}),
       discoveredVia: 'otel',
     }
     graph.addNode(fileNodeId, node)
