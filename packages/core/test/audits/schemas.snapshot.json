@@ -1276,6 +1276,9 @@
             "language": {
               "_optional": "_string"
             },
+            "originalPath": {
+              "_optional": "_string"
+            },
             "path": "_string",
             "service": "_string",
             "type": {
