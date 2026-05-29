@@ -22,10 +22,18 @@ const daemonSrc = readFileSync(join(HERE, '..', 'src', 'daemon.ts'), 'utf8')
 
 describe('daemon wires scanPath into every IngestContext (issue #434)', () => {
   it('hands scanPath: slot.entry.path to ingest at each handleSpan call site', () => {
-    const callSites = daemonSrc.match(/await handleSpan\(/g) ?? []
-    expect(callSites.length).toBeGreaterThan(0)
+    // Each handleSpan call passes an IngestContext literal followed by `span,`.
+    // Slice from each call to that argument boundary and assert the literal
+    // wires scanPath. Scoping to the call site keeps the unrelated
+    // `scanPath: slot.entry.path` in upsertRegistryFromSlot (the Projects
+    // registry mirror) out of the assertion.
+    const callBlocks = daemonSrc.split(/await handleSpan\(/).slice(1)
+    expect(callBlocks.length).toBeGreaterThan(0)
 
-    const scanPathWirings = daemonSrc.match(/scanPath:\s*slot\.entry\.path\b/g) ?? []
-    expect(scanPathWirings.length).toBe(callSites.length)
+    for (const block of callBlocks) {
+      const boundary = block.indexOf('span,')
+      const ctxLiteral = boundary === -1 ? block : block.slice(0, boundary)
+      expect(ctxLiteral).toMatch(/scanPath:\s*slot\.entry\.path\b/)
+    }
   })
 })
