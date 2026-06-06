@@ -95,9 +95,7 @@ export interface VisibleGraph {
 export function visibleGraph(
   nodes: GraphNode[],
   edges: GraphEdge[],
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   _model: FileFirstModel,
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   _expanded: Set<string>,
 ): VisibleGraph {
   const visibleNodes: GraphNode[] = []

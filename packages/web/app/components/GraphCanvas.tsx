@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useRef, useCallback, useState } from 'react'
+import { useEffect, useRef, useCallback } from 'react'
 import type { GraphNode, GraphEdge } from '@neat.is/types'
 import type { GraphData } from './AppShell'
 import { authedFetch, authedEventSourceUrl } from '../../lib/authed-fetch'
