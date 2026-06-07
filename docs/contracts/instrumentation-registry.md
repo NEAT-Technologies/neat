@@ -40,9 +40,9 @@ The seed JSON validates against a Zod schema covering this structure. A version 
 
 The registry ships on its own minor/patch cadence, decoupled from `neat.is`. `@neat.is/core` depends on it at a compatible range so registry refreshes reach users without bumping NEAT. This independent-versioning benefit is the structurally-unique reason the registry splits out while the rest of the substrate stays unified (ADR-086 §4). First published version is `1.0.0`; the schema is treated as stable from launch.
 
-## 5. The publish lockstep includes the registry
+## 5. The registry stays outside the publish lockstep; core pins it by caret range
 
-Per ADR-064, every NEAT release bumps all packages including the registry, so an install never mixes skewed versions. The registry's independent cadence (§4) is for between-release refreshes; the lockstep still pins a known-good registry version at each NEAT release.
+The six-package lockstep (publish-system contract) does not include the registry — bumping it on every NEAT release would defeat the independent cadence §4 exists for. Version safety comes from the dependency range instead: `@neat.is/core` depends on `@neat.is/instrumentation-registry` at `^1.0.0`, so refreshes within the stable schema (1.x) reach users without a NEAT release, and a breaking schema change (2.0) reaches no one until a NEAT release deliberately adopts it.
 
 ## 6. Refresh is offline, LLM-assisted, maintainer-reviewed, never auto-merged
 
