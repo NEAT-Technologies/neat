@@ -24,16 +24,18 @@ interface ProjectEntry { name: string; status?: 'active' | 'paused' | 'broken' }
 // web-multi-project §2.3 — pick the project to land on when neither the URL
 // nor localStorage named one. Prefer the first *active* project so we never
 // open onto a broken/paused one and blank the dashboard (#419). If none are
-// active, fall back to the first available project, then to 'default' (§2.4).
-export function resolveProjectFromList(list: ProjectEntry[]): string {
+// active, fall back to the first available project. An empty registry
+// resolves to null — there is no project named 'default', and requesting one
+// just 404s and floods the toaster (#461).
+export function resolveProjectFromList(list: ProjectEntry[]): string | null {
   const active = list.find((p) => p?.name && p.status === 'active')
   if (active?.name) return active.name
   const firstNamed = list.find((p) => p?.name)
   if (firstNamed?.name) return firstNamed.name
-  return 'default'
+  return null
 }
 
-// ADR-057 #2 — resolution chain. URL → localStorage → first /projects → 'default'.
+// ADR-057 #2 — resolution chain. URL → localStorage → first /projects.
 function readUrlProject(): string | null {
   if (typeof window === 'undefined') return null
   const v = new URLSearchParams(window.location.search).get('project')
@@ -59,8 +61,11 @@ export function AppShell() {
   // ADR-057 #2 — start with URL or localStorage (synchronous), then resolve
   // against /projects on mount if neither was set. Safe because AppShell
   // mounts client-only via dynamic({ ssr: false }) in app/page.tsx (ADR-062).
-  const [project, setProjectState] = useState<string>(() => {
-    return readUrlProject() ?? readStoredProject() ?? 'default'
+  // null means "not resolved yet" (or "registry is empty") — every
+  // data-fetching consumer gates on it, so nothing fires a doomed
+  // project=default request while resolution is in flight (#461).
+  const [project, setProjectState] = useState<string | null>(() => {
+    return readUrlProject() ?? readStoredProject()
   })
   const [debugOpen, setDebugOpen] = useState(false)
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -81,10 +86,12 @@ export function AppShell() {
     window.history.replaceState({}, '', url)
   }
 
-  // ADR-057 #2.3, #2.4 / web-multi-project §2.3 — if neither URL nor
-  // localStorage gave us a project, fetch /projects and resolve to the first
-  // *active* one (skip broken/paused so we don't open onto an empty graph,
-  // #419); fall back to the first available, then to 'default' if empty.
+  // ADR-057 #2.3 / web-multi-project §2.3 — if neither URL nor localStorage
+  // gave us a project, fetch /projects and resolve to the first *active* one
+  // (skip broken/paused so we don't open onto an empty graph, #419); fall
+  // back to the first available. If the registry is empty or unreachable,
+  // project stays null and the shell shows its no-project state instead of
+  // firing requests that can only 404 (#461).
   useEffect(() => {
     if (resolvedRef.current) return
     resolvedRef.current = true
@@ -92,10 +99,11 @@ export function AppShell() {
       .then((r) => (r.ok ? r.json() : []))
       .then((data: ProjectEntry[] | { projects?: ProjectEntry[] }) => {
         const list = Array.isArray(data) ? data : Array.isArray(data?.projects) ? data.projects : []
-        setProject(resolveProjectFromList(list))
+        const resolved = resolveProjectFromList(list)
+        if (resolved) setProject(resolved)
       })
       .catch(() => {
-        /* registry unreachable — keep 'default' fallback */
+        /* registry unreachable — stay unresolved, nothing to fetch against */
       })
   }, [])
 
@@ -109,7 +117,11 @@ export function AppShell() {
       .then((r) => (r.ok ? r.json() : []))
       .then((data: ProjectEntry[] | { projects?: ProjectEntry[] }) => {
         const list = Array.isArray(data) ? data : Array.isArray(data?.projects) ? data.projects : []
-        setProject(resolveProjectFromList(list))
+        const resolved = resolveProjectFromList(list)
+        // A null resolution clears the stale name so the consumers stop
+        // re-requesting a project the daemon already said doesn't exist.
+        if (resolved) setProject(resolved)
+        else setProjectState(null)
       })
       .catch(() => { /* registry unreachable — nothing to recover to */ })
   }
