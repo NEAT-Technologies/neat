@@ -5,13 +5,15 @@ import {
   visibleGraph,
   filesOf,
   callsFrom,
+  importsFrom,
 } from '../app/components/graph-model'
 
 // A small file-first graph (file-awareness.md §1-§3):
 //   service:a CONTAINS file:a/x, file:a/y
 //   service:b CONTAINS file:b/z
-//   file:a/x CALLS file:b/z   (file-grained, with evidence)
-//   file:a/y CONNECTS_TO database:d
+//   file:a/x CALLS file:b/z       (runtime — file-grained, with evidence)
+//   file:a/x IMPORTS file:a/y     (static module dependency, ADR-092 §10)
+//   file:a/y CONNECTS_TO database:d (declared, not a runtime call)
 const nodes: GraphNode[] = [
   { id: 'service:a', type: 'ServiceNode', name: 'a', language: 'ts' } as GraphNode,
   { id: 'service:b', type: 'ServiceNode', name: 'b', language: 'ts' } as GraphNode,
@@ -25,6 +27,7 @@ const edges: GraphEdge[] = [
   { id: 'c2', source: 'service:a', target: 'file:a:y.ts', type: 'CONTAINS', provenance: 'EXTRACTED' } as GraphEdge,
   { id: 'c3', source: 'service:b', target: 'file:b:z.ts', type: 'CONTAINS', provenance: 'EXTRACTED' } as GraphEdge,
   { id: 'call1', source: 'file:a:x.ts', target: 'file:b:z.ts', type: 'CALLS', provenance: 'OBSERVED', confidence: 0.9, evidence: { file: 'src/x.ts', line: 42 } } as GraphEdge,
+  { id: 'imp1', source: 'file:a:x.ts', target: 'file:a:y.ts', type: 'IMPORTS', provenance: 'EXTRACTED', confidence: 1, evidence: { file: 'src/x.ts', line: 1, snippet: "import { y } from './y'" } } as GraphEdge,
   { id: 'conn1', source: 'file:a:y.ts', target: 'database:d', type: 'CONNECTS_TO', provenance: 'EXTRACTED', confidence: 0.8, evidence: { file: 'src/y.ts', line: 7 } } as GraphEdge,
 ]
 
@@ -89,7 +92,7 @@ describe('file-first drill-down model (file-awareness §2/§3)', () => {
     expect(files).toEqual(['file:a:x.ts', 'file:a:y.ts'])
   })
 
-  it('callsFrom returns file-grained originating calls with provenance + file:line evidence (§1/§6)', () => {
+  it('callsFrom returns only runtime-call edges, never IMPORTS or CONNECTS_TO (file-awareness §10)', () => {
     const calls = callsFrom('file:a:x.ts', edges, model.byId)
     expect(calls).toHaveLength(1)
     expect(calls[0]).toMatchObject({
@@ -99,8 +102,28 @@ describe('file-first drill-down model (file-awareness §2/§3)', () => {
       evidenceFile: 'src/x.ts',
       evidenceLine: 42,
     })
+    // The IMPORTS edge from the same file must never surface as a "call" —
+    // that's the #456 bug (static module imports mislabeled as runtime calls).
+    expect(calls.some((c) => c.targetId === 'file:a:y.ts')).toBe(false)
+    // CONNECTS_TO is a declared relationship, not a runtime call — excluded.
+    expect(callsFrom('file:a:y.ts', edges, model.byId)).toHaveLength(0)
     // CONTAINS is structural ownership, not a call — excluded.
-    const svcCalls = callsFrom('service:a', edges, model.byId)
-    expect(svcCalls).toHaveLength(0)
+    expect(callsFrom('service:a', edges, model.byId)).toHaveLength(0)
+  })
+
+  it('importsFrom returns file-grained IMPORTS edges with provenance + file:line evidence, never CALLS (file-awareness §10)', () => {
+    const imports = importsFrom('file:a:x.ts', edges, model.byId)
+    expect(imports).toHaveLength(1)
+    expect(imports[0]).toMatchObject({
+      targetId: 'file:a:y.ts',
+      provenance: 'EXTRACTED',
+      confidence: 1,
+      evidenceFile: 'src/x.ts',
+      evidenceLine: 1,
+    })
+    // The CALLS edge from the same file must never surface as an "import".
+    expect(imports.some((i) => i.targetId === 'file:b:z.ts')).toBe(false)
+    // No outbound IMPORTS edge from file:a:y.ts — empty, not absent.
+    expect(importsFrom('file:a:y.ts', edges, model.byId)).toHaveLength(0)
   })
 })

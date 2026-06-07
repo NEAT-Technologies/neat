@@ -69,6 +69,27 @@ describe('import graph extraction (ADR-092, file-awareness.md §10)', () => {
     expect(edge.evidence?.snippet).toContain('format_total')
   })
 
+  it('resolves a two-dot Python relative import to its parent-package target, not a self-loop (#457)', async () => {
+    const graph = getGraph()
+    const result = await extractFromDirectory(graph, FIXTURES)
+
+    // app/api/jobs.py: `from ..jobs import get_job` walks up past the `api`
+    // package to app/jobs.py. tree-sitter-python groups `..` into a single
+    // import_prefix node with two `.` children — counting nodes instead of
+    // dots under-resolves to level=1 and lands back on the importer itself,
+    // which addImports rejects as a self-loop (UsageGraphError).
+    const edgeId =
+      'IMPORTS:file:fixture-imports-py-service:app/api/jobs.py->file:fixture-imports-py-service:app/jobs.py'
+    expect(graph.hasEdge(edgeId)).toBe(true)
+
+    const edge = graph.getEdgeAttributes(edgeId) as GraphEdge
+    expect(edge.source).not.toBe(edge.target)
+    expect(edge.provenance).toBe('EXTRACTED')
+    expect(edge.evidence?.file).toBe('app/api/jobs.py')
+    expect(edge.evidence?.snippet).toContain('get_job')
+    expect(result.extractionErrors).toBe(0)
+  })
+
   it('is idempotent across repeated passes', async () => {
     const graph = getGraph()
     const first = await extractFromDirectory(graph, FIXTURES)

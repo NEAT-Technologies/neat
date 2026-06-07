@@ -4,7 +4,7 @@ import { useEffect, useMemo, useState } from 'react'
 import type { GraphNode, GraphEdge } from '@neat.is/types'
 import type { GraphData } from './AppShell'
 import { authedFetch } from '../../lib/authed-fetch'
-import { buildModel, callsFrom, filesOf } from './graph-model'
+import { buildModel, callsFrom, importsFrom, filesOf } from './graph-model'
 
 interface RootCauseResult {
   origin: string
@@ -116,9 +116,14 @@ export function Inspector({ project, selectedNodeId, graphData, onNodeSelect }: 
   const isFile = node.type === 'FileNode'
   const isService = node.type === 'ServiceNode'
 
-  // FileNode: the calls originating from it, file-grained, with evidence.
+  // FileNode: the runtime calls originating from it, file-grained, with evidence.
   const originating = isFile && graphData && model
     ? callsFrom(node.id, graphData.edges, model.byId)
+    : []
+  // FileNode: the static module imports originating from it (file-awareness §10
+  // — IMPORTS is distinct from CALLS, surfaced in its own section).
+  const imports = isFile && graphData && model
+    ? importsFrom(node.id, graphData.edges, model.byId)
     : []
   // FileNode: its owning service via the inbound CONTAINS edge.
   const owningServiceId = isFile && model ? model.serviceByFile.get(node.id) : undefined
@@ -250,6 +255,39 @@ export function Inspector({ project, selectedNodeId, graphData, onNodeSelect }: 
                     </li>
                   )) : (
                     <li style={{ borderBottom: 'none' }}><span style={{ color: 'var(--fg-muted)', fontStyle: 'italic', fontFamily: 'var(--font-body)' }}>no calls originate from this file</span></li>
+                  )}
+                </ul>
+              </section>
+            )}
+
+            {/* FileNode — the static module imports originating from this file,
+                file-grained, each with provenance + evidence file:line. Kept
+                separate from "Calls from this file": IMPORTS is a compile-time
+                module dependency, not a runtime invocation (file-awareness §10). */}
+            {isFile && (
+              <section className="insp-section">
+                <div className="insp-h">Imports <span className="ct">{imports.length}</span></div>
+                <ul className="edge-list">
+                  {imports.length ? imports.map((c) => (
+                    <li key={c.edgeId} style={{ flexWrap: 'wrap', borderBottom: 'none' }}>
+                      <span style={{ display: 'flex', alignItems: 'center', gap: 10, width: '100%' }}>
+                        <span className={`pdot ${visualProv(c.provenance)}`} />
+                        <span className="verb">{visualProv(c.provenance).toLowerCase()}</span>
+                        <span
+                          className="target clickable"
+                          onClick={() => onNodeSelect(c.targetId)}
+                          title={`Select ${c.targetName}`}
+                        >{escapeHtml(c.targetName)}</span>
+                        <span className="conf">{typeof c.confidence === 'number' ? c.confidence.toFixed(2) : '—'}</span>
+                      </span>
+                      {c.evidenceFile && (
+                        <span className="edge-evidence" style={{ width: '100%' }}>
+                          {escapeHtml(c.evidenceFile)}{typeof c.evidenceLine === 'number' ? `:${c.evidenceLine}` : ''}
+                        </span>
+                      )}
+                    </li>
+                  )) : (
+                    <li style={{ borderBottom: 'none' }}><span style={{ color: 'var(--fg-muted)', fontStyle: 'italic', fontFamily: 'var(--font-body)' }}>no imports originate from this file</span></li>
                   )}
                 </ul>
               </section>

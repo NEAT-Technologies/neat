@@ -20,7 +20,7 @@
 // reads — but it stays the same file-grained edge with its own provenance and
 // evidence; we never synthesize a service→service summary edge.
 
-import type { GraphNode, GraphEdge } from '@neat.is/types'
+import { EdgeType, type GraphNode, type GraphEdge } from '@neat.is/types'
 
 export const CONTAINS = 'CONTAINS'
 
@@ -135,8 +135,10 @@ export function filesOf(serviceId: string, model: FileFirstModel): GraphNode[] {
   return ids.map((id) => model.byId.get(id)).filter((n): n is GraphNode => !!n)
 }
 
-// The calls originating from a file (file-grained CALLS edges), with evidence.
-export interface OriginatingCall {
+// A file-grained outbound edge, resolved to its target's display name, with
+// evidence. Shared shape for the Inspector's "Calls from this file" and
+// "Imports" sections (file-awareness.md §10 — IMPORTS is distinct from CALLS).
+export interface OriginatingEdge {
   edgeId: string
   targetId: string
   targetName: string
@@ -146,14 +148,19 @@ export interface OriginatingCall {
   evidenceLine?: number
 }
 
-export function callsFrom(fileId: string, edges: GraphEdge[], byId: Map<string, GraphNode>): OriginatingCall[] {
-  const calls: OriginatingCall[] = []
+function originatingEdges(
+  fileId: string,
+  edges: GraphEdge[],
+  byId: Map<string, GraphNode>,
+  matchesType: (type: string) => boolean,
+): OriginatingEdge[] {
+  const out: OriginatingEdge[] = []
   for (const e of edges) {
     if (e.source !== fileId) continue
-    if (e.type === CONTAINS) continue
+    if (!matchesType(e.type)) continue
     const target = byId.get(e.target)
     const name = target ? ((target as { name?: string; path?: string }).name ?? (target as { path?: string }).path ?? e.target) : e.target
-    calls.push({
+    out.push({
       edgeId: e.id,
       targetId: e.target,
       targetName: name,
@@ -163,5 +170,27 @@ export function callsFrom(fileId: string, edges: GraphEdge[], byId: Map<string, 
       evidenceLine: e.evidence?.line,
     })
   }
-  return calls
+  return out
+}
+
+// The runtime calls originating from a file — HTTP requests, queue
+// publish/consume, and other live invocations (file-grained CALLS /
+// PUBLISHES_TO / CONSUMES_FROM edges), with evidence. CONNECTS_TO and
+// CONFIGURED_BY are declared/static relationships, not runtime calls, and
+// IMPORTS is a compile-time module dependency — see importsFrom — so none of
+// the three belong in this list (file-awareness.md §10).
+export function callsFrom(fileId: string, edges: GraphEdge[], byId: Map<string, GraphNode>): OriginatingEdge[] {
+  return originatingEdges(
+    fileId,
+    edges,
+    byId,
+    (t) => t === EdgeType.CALLS || t === EdgeType.PUBLISHES_TO || t === EdgeType.CONSUMES_FROM,
+  )
+}
+
+// The static module imports originating from a file (file-grained IMPORTS
+// edges), with evidence. Compile-time module dependencies, distinct from
+// runtime calls (file-awareness.md §10).
+export function importsFrom(fileId: string, edges: GraphEdge[], byId: Map<string, GraphNode>): OriginatingEdge[] {
+  return originatingEdges(fileId, edges, byId, (t) => t === EdgeType.IMPORTS)
 }
