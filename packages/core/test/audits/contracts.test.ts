@@ -7147,9 +7147,8 @@ describe('Web shell completeness (ADR-056)', () => {
   it('Rail: Agents button wired or disabled (ADR-056 #1)', () => {
     assertWiredOrDisabled(readComponent('Rail'), 'Agents', 'Rail.tsx')
   })
-  it('Rail: Settings button wired or disabled (ADR-056 #1)', () => {
-    assertWiredOrDisabled(readComponent('Rail'), 'Settings', 'Rail.tsx')
-  })
+  // Rail: Settings was removed for launch (#473) — no settings surface exists
+  // behind it, so there is nothing to assert wired-or-disabled anymore.
   it('GraphCanvas toolbar: Layout: cose toggle wired or disabled (ADR-056 #1)', () => {
     const src = readComponent('GraphCanvas')
     expect(src).toMatch(/Layout:/)

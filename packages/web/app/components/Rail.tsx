@@ -39,9 +39,10 @@ export function Rail({ project }: RailProps) {
   }, [project])
 
   // ADR-056 — Find is wired: dispatches a custom event TopBar's search input listens for.
-  // ADR-056 — Layers / NeatScript / Time travel / Diff / Comments / Agents / Settings
-  // are deferred features; rendered with `disabled` + tooltip affordance so the user
-  // perceives them as unavailable, not broken.
+  // ADR-056 — Layers / NeatScript / Time travel / Diff / Comments / Agents are
+  // deferred features; rendered with `disabled` + tooltip affordance so the user
+  // perceives them as unavailable, not broken. Settings was removed outright (#473) —
+  // no surface exists behind it yet.
   function focusFind(): void {
     const input = document.querySelector<HTMLInputElement>('.top-search input')
     input?.focus()
@@ -129,16 +130,6 @@ export function Rail({ project }: RailProps) {
       </div>
 
       <div className="rail-spacer" />
-
-      <div className="rail-group" style={{ borderTop: '1px solid var(--rule)' }}>
-        <button className="rail-btn" aria-label="Settings (coming soon)" disabled title={disabledTip('Settings')} style={{ opacity: 0.35, cursor: 'not-allowed' }}>
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor">
-            <circle cx="12" cy="12" r="3" />
-            <path d="M19 12a7 7 0 0 1-.4 2.3l2 1.5-2 3.4-2.3-1a7 7 0 0 1-4 2.3l-.4 2.5h-4l-.4-2.5a7 7 0 0 1-4-2.3l-2.3 1-2-3.4 2-1.5A7 7 0 0 1 5 12a7 7 0 0 1 .4-2.3l-2-1.5 2-3.4 2.3 1a7 7 0 0 1 4-2.3L12 1h4l.4 2.5a7 7 0 0 1 4 2.3l2.3-1 2 3.4-2 1.5" />
-          </svg>
-          <span className="rail-tip">Settings</span>
-        </button>
-      </div>
     </nav>
   )
 }

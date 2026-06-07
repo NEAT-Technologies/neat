@@ -24,10 +24,10 @@
 │    │
 │    │  (spacer — flex: 1)
 │    │
-├────┤  (divider top)
-│ ⚙  │  Settings
 └────┘
 ```
+
+(The bottom Settings gear was removed for launch — #473. No settings surface exists behind it yet.)
 
 Width: 56px. Each button: 36×36px, border-radius 4px.
 
@@ -47,7 +47,6 @@ Width: 56px. Each button: 36×36px, border-radius 4px.
 | 8 | Comments | Chat bubble | `C` | None | Stub |
 | 9 | Incidents | Warning triangle | _(none)_ | `<Link href="/incidents">` | **Navigates** |
 | 10 | Agents | Sunburst / rays | `A` | None | Stub |
-| 11 | Settings | Gear | _(none)_ | None | Stub |
 
 ---
 
@@ -100,9 +99,7 @@ group 1: Graph, Layers, Find
 group 2: NeatScript, Time travel, Blast radius, Diff
 ─── divider ───
 group 3: Comments, Incidents, Agents
-.rail-spacer (flex: 1 — pushes settings to bottom)
-─── divider (border-top on group wrapper) ───
-group 4: Settings
+.rail-spacer (flex: 1)
 ```
 
 ---

@@ -44,7 +44,6 @@ When code state changes, this file changes in lockstep.
 | Comments (C) | disabled | Tooltip: "Comments — coming in v0.3.x". |
 | Incidents | wired | Routes to `/incidents`; badge from `/api/incidents`. |
 | Agents (A) | disabled | Tooltip: "Agents — coming in v0.3.x". |
-| Settings | disabled | Tooltip: "Settings — coming in v0.3.x". |
 
 ### Inspector
 
