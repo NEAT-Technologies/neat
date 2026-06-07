@@ -5,6 +5,8 @@ import type { GraphData } from '../app/components/AppShell'
 import { Inspector } from '../app/components/Inspector'
 
 // file-first sample: service:a CONTAINS file:a/x; file:a/x CALLS database:d
+// (a runtime database query — CONNECTS_TO is a declared relationship, not a
+// call, and stays out of "Calls from this file" per file-awareness §10.)
 const nodes: GraphNode[] = [
   { id: 'service:a', type: 'ServiceNode', name: 'a', language: 'ts' } as GraphNode,
   { id: 'file:a:x.ts', type: 'FileNode', service: 'a', path: 'src/x.ts', language: 'ts' } as GraphNode,
@@ -12,7 +14,7 @@ const nodes: GraphNode[] = [
 ]
 const edges: GraphEdge[] = [
   { id: 'c1', source: 'service:a', target: 'file:a:x.ts', type: 'CONTAINS', provenance: 'EXTRACTED' } as GraphEdge,
-  { id: 'call1', source: 'file:a:x.ts', target: 'database:d', type: 'CONNECTS_TO', provenance: 'OBSERVED', confidence: 0.91, evidence: { file: 'src/x.ts', line: 128 } } as GraphEdge,
+  { id: 'call1', source: 'file:a:x.ts', target: 'database:d', type: 'CALLS', provenance: 'OBSERVED', confidence: 0.91, evidence: { file: 'src/x.ts', line: 128 } } as GraphEdge,
 ]
 const graphData: GraphData = { nodes, edges }
 

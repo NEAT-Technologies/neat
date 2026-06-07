@@ -141,8 +141,16 @@ function collectPyImports(node: Parser.SyntaxNode, out: RawPyImport[]): void {
         for (let j = 0; j < child.childCount; j++) {
           const rc = child.child(j)
           if (!rc) continue
-          if (rc.type === 'import_prefix') level++
-          else if (rc.type === 'dotted_name') modulePath = rc.text
+          // tree-sitter-python groups every leading dot into a single
+          // import_prefix node — `..` parses as one import_prefix with two
+          // `.` children, not two import_prefix nodes. Count the `.` tokens,
+          // not the prefix nodes, or multi-dot imports under-count `level`
+          // and resolve onto the wrong (sometimes self) target (#457).
+          if (rc.type === 'import_prefix') {
+            for (let k = 0; k < rc.childCount; k++) {
+              if (rc.child(k)?.type === '.') level++
+            }
+          } else if (rc.type === 'dotted_name') modulePath = rc.text
         }
         break
       }
