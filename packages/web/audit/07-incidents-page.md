@@ -93,12 +93,17 @@ interface IncidentsResponse {
   total: number
   events: Incident[]
 }
+// Canonical ErrorEvent fields from @neat.is/types (#474) — the table maps
+// affectedNode / errorType / errorMessage / exceptionStacktrace.
 interface Incident {
-  nodeId: string
+  id: string
   timestamp: string   // ISO 8601
-  type: string
-  message: string
-  stacktrace?: string  // fetched but not displayed
+  service: string
+  errorType?: string
+  errorMessage: string
+  exceptionType?: string
+  exceptionStacktrace?: string
+  affectedNode: string
 }
 ```
 

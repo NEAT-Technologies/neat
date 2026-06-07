@@ -1,17 +1,23 @@
 'use client'
 
-import { useEffect, useState } from 'react'
+import { Fragment, useEffect, useState } from 'react'
 import Link from 'next/link'
 import { authedFetch } from '../../lib/authed-fetch'
 import { useAuthGate } from '../../lib/use-auth-gate'
 import { resolveProjectFromList, type ProjectEntry } from '../../lib/resolve-project'
 
+// Mirrors the canonical ErrorEvent shape from @neat.is/types — the daemon's
+// /api/incidents envelope (ADR-061) carries these fields, not the
+// nodeId/type/message trio this table once assumed (#474).
 interface Incident {
-  nodeId: string
+  id: string
   timestamp: string
-  type: string
-  message: string
-  stacktrace?: string
+  service: string
+  errorType?: string
+  errorMessage: string
+  exceptionType?: string
+  exceptionStacktrace?: string
+  affectedNode: string
 }
 
 interface IncidentsResponse {
@@ -136,38 +142,37 @@ export function IncidentsClient() {
             </thead>
             <tbody>
               {data.events.map((evt, i) => {
-                const rowKey = `${i}-${evt.nodeId}`
+                const rowKey = `${i}-${evt.id}`
                 const isOpen = openRow === rowKey
                 return (
-                  <>
+                  <Fragment key={rowKey}>
                     <tr
-                      key={rowKey}
-                      style={{ cursor: evt.stacktrace ? 'pointer' : undefined }}
-                      onClick={() => evt.stacktrace && setOpenRow(isOpen ? null : rowKey)}
-                      title={evt.stacktrace ? (isOpen ? 'Collapse stacktrace' : 'Expand stacktrace') : undefined}
+                      style={{ cursor: evt.exceptionStacktrace ? 'pointer' : undefined }}
+                      onClick={() => evt.exceptionStacktrace && setOpenRow(isOpen ? null : rowKey)}
+                      title={evt.exceptionStacktrace ? (isOpen ? 'Collapse stacktrace' : 'Expand stacktrace') : undefined}
                     >
                       <td className="td-node">
-                        <Link href={`/?node=${encodeURIComponent(evt.nodeId)}&project=${encodeURIComponent(project ?? '')}`} className="incidents-node-link">
-                          {evt.nodeId}
+                        <Link href={`/?node=${encodeURIComponent(evt.affectedNode)}&project=${encodeURIComponent(project ?? '')}`} className="incidents-node-link">
+                          {evt.affectedNode}
                         </Link>
                       </td>
                       <td className="td-time">{formatTs(evt.timestamp)}</td>
-                      <td className="td-type">{evt.type}</td>
+                      <td className="td-type">{evt.errorType ?? evt.exceptionType ?? '—'}</td>
                       <td className="td-msg">
-                        {evt.message}
-                        {evt.stacktrace && (
+                        {evt.errorMessage}
+                        {evt.exceptionStacktrace && (
                           <span className="stack-toggle">{isOpen ? ' ▲' : ' ▼'}</span>
                         )}
                       </td>
                     </tr>
-                    {isOpen && evt.stacktrace && (
-                      <tr key={`${rowKey}-stack`}>
+                    {isOpen && evt.exceptionStacktrace && (
+                      <tr>
                         <td colSpan={4} className="td-stacktrace">
-                          <pre className="stacktrace-pre">{evt.stacktrace}</pre>
+                          <pre className="stacktrace-pre">{evt.exceptionStacktrace}</pre>
                         </td>
                       </tr>
                     )}
-                  </>
+                  </Fragment>
                 )
               })}
             </tbody>
