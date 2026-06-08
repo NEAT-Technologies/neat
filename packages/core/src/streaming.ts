@@ -1,6 +1,8 @@
 // SSE handler for the frontend-facing event stream (ADR-051 #1).
 // Subscribes to the bus in events.ts, filters by project, writes
-// `event: <type>\ndata: <json>\n\n` frames to the client.
+// `event: <type>\ndata: <json>\n\n` frames to the client. An initial
+// `:open\n\n` comment goes out at the handshake so EventSource opens
+// right away instead of waiting on the first event or heartbeat.
 //
 // Backpressure: per-connection queue cap of 1000 outstanding writes; once
 // hit, the connection is dropped with `event: error data: { reason:
@@ -36,6 +38,17 @@ export function handleSse(
   reply.raw.setHeader('Connection', 'keep-alive')
   reply.raw.setHeader('X-Accel-Buffering', 'no')
   reply.raw.flushHeaders?.()
+
+  // Flushing headers leaves the response body empty, so the browser's
+  // EventSource stays in CONNECTING (readyState 0) until the first body byte
+  // lands — which, on a quiet graph, is the first real event or the 30s
+  // heartbeat, whichever comes first. Write a comment line right away so the
+  // stream opens at the handshake and EventSource fires onopen immediately.
+  // A colon-prefixed comment is a no-op per the SSE spec (clients ignore it,
+  // same as the heartbeat), so it sits outside the locked ADR-051 taxonomy.
+  // Written raw, bypassing the backpressure accounting below, exactly like
+  // the heartbeat does.
+  reply.raw.write(':open\n\n')
 
   let pending = 0
   let dropped = false

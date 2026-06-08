@@ -202,6 +202,38 @@ describe('daemon slots feed the event bus (issue #475)', () => {
     expect(envelopes).toEqual([])
   })
 
+  it('e2e: a real /events connection receives the :open frame at connect time, before any span (issue #356)', { timeout: 20_000 }, async () => {
+    const sandbox = await setupSandbox(['evt-open'])
+    pendingCleanups.push(sandbox.cleanup)
+    const { startDaemon } = await import('../src/daemon.js')
+    const handle = await startDaemon()
+    pendingCleanups.push(handle.stop)
+    await handle.initialBootstrap
+    expect(handle.restAddress).not.toBe('')
+
+    const abort = new AbortController()
+    pendingCleanups.push(async () => abort.abort())
+    const sseRes = await fetch(`${handle.restAddress}/projects/evt-open/events`, {
+      headers: { accept: 'text/event-stream' },
+      signal: abort.signal,
+    })
+    expect(sseRes.status).toBe(200)
+
+    // Read the first chunk off the body. The fix writes `:open\n\n` right at
+    // the handshake, so the first byte arrives without any graph mutation and
+    // long before the 30s heartbeat — on unfixed main this read would hang
+    // until the heartbeat tick. A short race guards against that hang.
+    const reader = sseRes.body!.getReader()
+    const decoder = new TextDecoder()
+    const firstChunk = await Promise.race([
+      reader.read().then(({ value }) => decoder.decode(value ?? new Uint8Array())),
+      new Promise<string>((resolve) => setTimeout(() => resolve(''), 5_000)),
+    ])
+    expect(firstChunk, 'first body chunk on connect').toContain(':open')
+
+    abort.abort()
+  })
+
   it('e2e: a span on the live OTLP receiver arrives as an edge-added frame on a real /events connection', { timeout: 20_000 }, async () => {
     const sandbox = await setupSandbox(['evt-wire'])
     pendingCleanups.push(sandbox.cleanup)
