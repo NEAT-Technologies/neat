@@ -35,6 +35,7 @@ import { loadGraphFromDisk, startPersistLoop } from './persist.js'
 import { Projects, pathsForProject, type ProjectPaths } from './projects.js'
 import { buildApi } from './api.js'
 import { buildOtelReceiver } from './otel.js'
+import { attachGraphToEventBus } from './events.js'
 import { handleSpan, makeErrorSpanWriter } from './ingest.js'
 import {
   listProjects,
@@ -73,8 +74,29 @@ export interface ProjectSlot {
   outPath: string
   paths: ProjectPaths
   stopPersist: () => void
+  // #475 — removes the event-bus listeners attachGraphToEventBus installed
+  // on this slot's graph. No-op for broken slots. Must run wherever the slot
+  // is torn down or replaced, or a reloaded slot's old graph keeps emitting.
+  detachEvents: () => void
   status: 'active' | 'broken'
   errorReason?: string
+}
+
+// Best-effort slot teardown — stop the persist loop and detach the slot's
+// graph from the event bus (#475). Every path that drops or replaces a slot
+// (registry removal, daemon stop, bind-failure rollback, broken-slot
+// recovery) goes through here so no path leaks listeners.
+function teardownSlot(slot: ProjectSlot): void {
+  try {
+    slot.stopPersist()
+  } catch {
+    // best-effort
+  }
+  try {
+    slot.detachEvents()
+  } catch {
+    // best-effort
+  }
 }
 
 // Issue #340 — per-project bootstrap state surface. The REST listener
@@ -222,6 +244,7 @@ async function bootstrapProject(entry: RegistryEntry): Promise<ProjectSlot> {
       outPath: '',
       paths,
       stopPersist: () => {},
+      detachEvents: () => {},
       status: 'broken',
       errorReason: (err as Error).message,
     }
@@ -235,17 +258,31 @@ async function bootstrapProject(entry: RegistryEntry): Promise<ProjectSlot> {
   const outPath = paths.snapshotPath
 
   await loadGraphFromDisk(graph, outPath)
-  await extractFromDirectory(graph, entry.path)
-  const stopPersist = startPersistLoop(graph, outPath)
-  await touchLastSeen(entry.name).catch(() => {})
+  // #475 — wire graph mutations into the event bus (ADR-051) before extract
+  // begins so the initial pass also produces node/edge events, mirroring
+  // startWatch. Without this the daemon's SSE stream carries heartbeats and
+  // nothing else: handleSse subscribes to a bus no producer feeds, and the
+  // dashboard only catches up on a manual refresh.
+  const detachEvents = attachGraphToEventBus(graph, { project: entry.name })
+  try {
+    await extractFromDirectory(graph, entry.path)
+    const stopPersist = startPersistLoop(graph, outPath)
+    await touchLastSeen(entry.name).catch(() => {})
 
-  return {
-    entry,
-    graph,
-    outPath,
-    paths,
-    stopPersist,
-    status: 'active',
+    return {
+      entry,
+      graph,
+      outPath,
+      paths,
+      stopPersist,
+      detachEvents,
+      status: 'active',
+    }
+  } catch (err) {
+    // Bootstrap died after the attach — detach before surfacing so a failed
+    // slot can't leave listeners behind on its orphaned graph.
+    detachEvents()
+    throw err
   }
 }
 
@@ -368,6 +405,10 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<DaemonHandl
   async function tryRecoverSlot(entry: RegistryEntry): Promise<ProjectSlot> {
     try {
       const fresh = await bootstrapProject(entry)
+      // The slot being replaced must release its graph's bus listeners
+      // (#475) — a stale attach on the prior graph would double-emit.
+      const prior = slots.get(entry.name)
+      if (prior) teardownSlot(prior)
       slots.set(entry.name, fresh)
       upsertRegistryFromSlot(fresh)
       if (fresh.status === 'active') {
@@ -391,6 +432,9 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<DaemonHandl
     bootstrapStartedAt.set(entry.name, Date.now())
     try {
       const slot = await bootstrapProject(entry)
+      // Same replacement rule as tryRecoverSlot (#475).
+      const prior = slots.get(entry.name)
+      if (prior) teardownSlot(prior)
       slots.set(entry.name, slot)
       upsertRegistryFromSlot(slot)
       bootstrapStatus.set(entry.name, slot.status === 'broken' ? 'broken' : 'active')
@@ -425,11 +469,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<DaemonHandl
     }
     for (const [name, slot] of [...slots.entries()]) {
       if (seen.has(name)) continue
-      try {
-        slot.stopPersist()
-      } catch {
-        // best-effort
-      }
+      teardownSlot(slot)
       slots.delete(name)
       bootstrapStatus.delete(name)
       bootstrapStartedAt.delete(name)
@@ -494,11 +534,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<DaemonHandl
     } catch (err) {
       // Roll back anything we started so far before surfacing the error.
       for (const slot of slots.values()) {
-        try {
-          slot.stopPersist()
-        } catch {
-          // best-effort
-        }
+        teardownSlot(slot)
       }
       if (restApp) await restApp.close().catch(() => {})
       await fs.unlink(pidPath).catch(() => {})
@@ -625,11 +661,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<DaemonHandl
       console.log(`neatd: OTLP listening on ${otlpAddress}/v1/traces`)
     } catch (err) {
       for (const slot of slots.values()) {
-        try {
-          slot.stopPersist()
-        } catch {
-          // best-effort
-        }
+        teardownSlot(slot)
       }
       if (restApp) await restApp.close().catch(() => {})
       if (otlpApp) await otlpApp.close().catch(() => {})
@@ -740,11 +772,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<DaemonHandl
     if (otlpApp) await otlpApp.close().catch(() => {})
     if (restApp) await restApp.close().catch(() => {})
     for (const slot of slots.values()) {
-      try {
-        slot.stopPersist()
-      } catch {
-        // best-effort
-      }
+      teardownSlot(slot)
     }
     await fs.unlink(pidPath).catch(() => {})
   }
