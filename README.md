@@ -5,10 +5,12 @@
 [![Release](https://img.shields.io/github/v/release/NEAT-Technologies/Neat)](https://github.com/NEAT-Technologies/Neat/releases)
 [![Website](https://img.shields.io/badge/website-neat.is-black)](https://neat.is)
 
-NEAT constructs a live deterministic architecture model of your codebase for AI to query, code, debug and write rules for. In theory, this achieves the following:
+NEAT constructs a live deterministic architecture model of your codebase for AI to query, code, debug and write rules for. This achieves the following:
 - Coding LLMs hallucinate less & are more accurate.
 - Rather than endlessly grepping files and guessing problems, NEAT provides time-travelling error logs along the model's nodes and edges so the LLM can infer exactly what's wrong.
 - Rules & Policies allow agents to write new features while adhering to rules set by previous features, other LLMs, or engineers. For example, only use postgres for services x and y, and mongoDB for services p and q (the possibilities are endless).
+
+TL;DR The deterministic grounded truth of code for your agents. 
 
 NEAT is in active development. Capability ships as patch releases on the `npx neat.is` surface; see [open issues](https://github.com/NEAT-Technologies/Neat/issues) for what's on deck. 
 
