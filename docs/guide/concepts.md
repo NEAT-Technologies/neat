@@ -1,6 +1,6 @@
 # Core concepts
 
-NEAT keeps a single live graph of your system and tells you where the parts of it disagree. Four ideas carry the whole model: the **graph**, **provenance**, **divergence**, and the **file as the unit**. Understand these and everything else in NEAT follows.
+Four ideas carry the whole model: the **graph**, **provenance**, **divergence**, and the **file as the unit**. Understand these and everything else in NEAT follows.
 
 ## The graph
 
