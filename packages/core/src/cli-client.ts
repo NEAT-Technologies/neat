@@ -69,7 +69,7 @@ export function resolveAuthToken(env: NodeJS.ProcessEnv = process.env): string |
 
 export function createHttpClient(baseUrl: string, bearerToken?: string): HttpClient {
   const root = baseUrl.replace(/\/$/, '')
-  const authHeader = bearerToken && bearerToken.length > 0
+  const authHeader: Record<string, string> = bearerToken && bearerToken.length > 0
     ? { authorization: `Bearer ${bearerToken}` }
     : {}
   return {

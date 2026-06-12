@@ -44,6 +44,7 @@ import {
   formatHuman,
   formatJson,
   HttpError,
+  type HttpClient,
   resolveAuthToken,
   runBlastRadius,
   runDependencies,
@@ -1012,12 +1013,85 @@ export const QUERY_VERBS: Set<string> = new Set([
 
 // ADR-050 #2: --project flag → NEAT_PROJECT env → undefined (server's
 // `default` slot). undefined keeps legacy unprefixed routes; explicit names
-// route through /projects/:project/...
+// route through /projects/:project/... Returns undefined when neither was set,
+// which is the signal to resolveProjectForVerb that it should look at the
+// registered projects and pick intelligently.
 function resolveProjectFlag(parsed: ParsedArgs): string | undefined {
   if (parsed.project) return parsed.project
   const env = process.env.NEAT_PROJECT
   if (env && env.length > 0 && env !== DEFAULT_PROJECT) return env
   return undefined
+}
+
+// Thrown when a bare query verb (no --project, no NEAT_PROJECT) can't pick a
+// project on its own — either nothing is registered, or several are and none
+// is named `default`. Carries an exit code so the dispatcher can surface a
+// helpful message instead of letting the request 404 on the `default` slot.
+export class ProjectResolutionError extends Error {
+  constructor(
+    message: string,
+    public readonly exitCode: number = 2,
+  ) {
+    super(message)
+    this.name = 'ProjectResolutionError'
+  }
+}
+
+// What `GET /projects` hands back (registry.ts RegistryEntry passthrough). We
+// only read `name`, so keep the shape minimal.
+interface RegistryProjectSummary {
+  name: string
+}
+
+// Decide which project a bare query verb should route to (issue #500). When the
+// user passed --project or set NEAT_PROJECT, that wins untouched. Otherwise we
+// ask the daemon which projects it has registered and pick:
+//
+//   • exactly one registered → use it (the one-command `npx neat.is` case, so
+//     `neat divergences` "just works" without --project)
+//   • a project literally named `default` exists → keep the legacy default
+//     routing (return undefined → unprefixed routes the server maps to default)
+//   • several registered, none `default` → don't guess; error and list them
+//   • none registered → error clearly rather than 404 on `default`
+//
+// A daemon that can't be reached lets the TransportError propagate, so the verb
+// still exits 3 with the existing "is the daemon running?" message.
+export async function resolveProjectForVerb(
+  client: HttpClient,
+  parsed: ParsedArgs,
+): Promise<string | undefined> {
+  const explicit = resolveProjectFlag(parsed)
+  if (explicit) return explicit
+
+  // Bare verb. Let TransportError out (exit 3); only HttpError/parse issues
+  // become a resolution error here.
+  const projects = await client.get<RegistryProjectSummary[]>('/projects')
+
+  if (projects.some((p) => p.name === DEFAULT_PROJECT)) {
+    // Back-compat: a real `default` project exists, so the legacy unprefixed
+    // routes resolve. Returning undefined keeps that path.
+    return undefined
+  }
+
+  if (projects.length === 1) {
+    return projects[0]!.name
+  }
+
+  if (projects.length === 0) {
+    throw new ProjectResolutionError(
+      'No projects are registered with the daemon yet. Run `npx neat.is` in a repo to build a graph first, then re-run this command.',
+    )
+  }
+
+  const names = projects
+    .map((p) => p.name)
+    .sort()
+    .map((n) => `  ${n}`)
+    .join('\n')
+  throw new ProjectResolutionError(
+    `Several projects are registered and none is named "default", so I can't pick one for you.\n` +
+      `Pass --project <name> to choose:\n${names}`,
+  )
 }
 
 // The daemon URL the CLI verbs talk to. `NEAT_API_URL` is the name the verbs
@@ -1033,11 +1107,13 @@ export async function runQueryVerb(cmd: string, parsed: ParsedArgs): Promise<num
   // ADR-073 §3 — read the bearer once and thread it into the single client
   // every verb shares, so no verb path can reach a secured daemon without it.
   const client = createHttpClient(baseUrl, resolveAuthToken())
-  const project = resolveProjectFlag(parsed)
   const positional = parsed.positional
 
-  // Per-verb arg/flag validation. Misuse exits 2 before any network call.
-  let work: Promise<VerbResult>
+  // Per-verb arg/flag validation runs first so misuse exits 2 before any
+  // network call (ADR-050 #4). Each case builds a thunk that takes the
+  // resolved project — we resolve the project (issue #500) only after the verb
+  // proves well-formed, since resolution itself hits the daemon's /projects.
+  let makeWork: (project: string | undefined) => Promise<VerbResult>
   switch (cmd) {
     case 'root-cause': {
       const node = positional[0]
@@ -1045,7 +1121,7 @@ export async function runQueryVerb(cmd: string, parsed: ParsedArgs): Promise<num
         console.error('neat root-cause: missing <node-id>')
         return 2
       }
-      work = runRootCause(client, {
+      makeWork = (project) => runRootCause(client, {
         errorNode: node,
         ...(parsed.errorId ? { errorId: parsed.errorId } : {}),
         ...(project ? { project } : {}),
@@ -1058,7 +1134,7 @@ export async function runQueryVerb(cmd: string, parsed: ParsedArgs): Promise<num
         console.error('neat blast-radius: missing <node-id>')
         return 2
       }
-      work = runBlastRadius(client, {
+      makeWork = (project) => runBlastRadius(client, {
         nodeId: node,
         ...(parsed.depth !== null ? { depth: parsed.depth } : {}),
         ...(project ? { project } : {}),
@@ -1071,7 +1147,7 @@ export async function runQueryVerb(cmd: string, parsed: ParsedArgs): Promise<num
         console.error('neat dependencies: missing <node-id>')
         return 2
       }
-      work = runDependencies(client, {
+      makeWork = (project) => runDependencies(client, {
         nodeId: node,
         ...(parsed.depth !== null ? { depth: parsed.depth } : {}),
         ...(project ? { project } : {}),
@@ -1084,7 +1160,7 @@ export async function runQueryVerb(cmd: string, parsed: ParsedArgs): Promise<num
         console.error('neat observed-dependencies: missing <node-id>')
         return 2
       }
-      work = runObservedDependencies(client, {
+      makeWork = (project) => runObservedDependencies(client, {
         nodeId: node,
         ...(project ? { project } : {}),
       })
@@ -1092,7 +1168,7 @@ export async function runQueryVerb(cmd: string, parsed: ParsedArgs): Promise<num
     }
     case 'incidents': {
       // node-id is optional — bare `neat incidents` returns the global log.
-      work = runIncidents(client, {
+      makeWork = (project) => runIncidents(client, {
         ...(positional[0] ? { nodeId: positional[0] } : {}),
         ...(parsed.limit !== null ? { limit: parsed.limit } : {}),
         ...(project ? { project } : {}),
@@ -1105,7 +1181,7 @@ export async function runQueryVerb(cmd: string, parsed: ParsedArgs): Promise<num
         console.error('neat search: missing <query>')
         return 2
       }
-      work = runSearch(client, { query: q, ...(project ? { project } : {}) })
+      makeWork = (project) => runSearch(client, { query: q, ...(project ? { project } : {}) })
       break
     }
     case 'diff': {
@@ -1118,14 +1194,14 @@ export async function runQueryVerb(cmd: string, parsed: ParsedArgs): Promise<num
         console.error('neat diff: --against <snapshot-path> is required')
         return 2
       }
-      work = runDiff(client, {
+      makeWork = (project) => runDiff(client, {
         againstSnapshot: against,
         ...(project ? { project } : {}),
       })
       break
     }
     case 'stale-edges': {
-      work = runStaleEdges(client, {
+      makeWork = (project) => runStaleEdges(client, {
         ...(parsed.limit !== null ? { limit: parsed.limit } : {}),
         ...(parsed.edgeType ? { edgeType: parsed.edgeType } : {}),
         ...(project ? { project } : {}),
@@ -1144,7 +1220,7 @@ export async function runQueryVerb(cmd: string, parsed: ParsedArgs): Promise<num
           return 2
         }
       }
-      work = runPolicies(client, {
+      makeWork = (project) => runPolicies(client, {
         ...(parsed.node ? { nodeId: parsed.node } : {}),
         ...(hypothetical ? { hypotheticalAction: hypothetical } : {}),
         ...(project ? { project } : {}),
@@ -1171,7 +1247,7 @@ export async function runQueryVerb(cmd: string, parsed: ParsedArgs): Promise<num
         }
         typeFilter = out
       }
-      work = runDivergences(client, {
+      makeWork = (project) => runDivergences(client, {
         ...(typeFilter ? { type: typeFilter } : {}),
         ...(parsed.minConfidence !== null ? { minConfidence: parsed.minConfidence } : {}),
         ...(parsed.node ? { node: parsed.node } : {}),
@@ -1186,7 +1262,13 @@ export async function runQueryVerb(cmd: string, parsed: ParsedArgs): Promise<num
   }
 
   try {
-    const result = await work
+    // Resolve which project to route to (issue #500). When --project /
+    // NEAT_PROJECT are set this is a no-op; otherwise it asks the daemon's
+    // /projects list and picks the single registered one (or keeps `default`).
+    // A TransportError from here means the daemon is down — same exit-3 path as
+    // any verb call.
+    const project = await resolveProjectForVerb(client, parsed)
+    const result = await makeWork(project)
     if (parsed.json) process.stdout.write(formatJson(result) + '\n')
     else process.stdout.write(formatHuman(result) + '\n')
     return 0
@@ -1194,6 +1276,12 @@ export async function runQueryVerb(cmd: string, parsed: ParsedArgs): Promise<num
     // Server / transport errors land on stderr per ADR-050 #3 (stderr for
     // diagnostics, stdout for results — never mix). Exit code branches per
     // ADR-050 #4: 1 for HttpError, 3 for TransportError.
+    if (err instanceof ProjectResolutionError) {
+      // Couldn't pick a project on the user's behalf (none registered, or
+      // several and none named `default`). The message already says what to do.
+      console.error(`neat ${cmd}: ${err.message}`)
+      return err.exitCode
+    }
     if (err instanceof HttpError) {
       const detail = err.responseBody.length > 0 ? err.responseBody : err.message
       console.error(`neat ${cmd}: ${detail.trim()}`)
