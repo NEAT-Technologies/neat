@@ -40,7 +40,9 @@ neat divergences [--min-confidence N]                ← get_divergences
 
 ## REST-only data path
 
-Every verb hits `NEAT_API_URL` (default `http://localhost:8080`) via a shared client. **No `graph.json` reads at request time.** Same multi-project routing as MCP — `--project <name>` flag → `NEAT_PROJECT` env → `'default'` (ADR-026).
+Every verb hits `NEAT_API_URL` (default `http://localhost:8080`) via a shared client. **No `graph.json` reads at request time.** Multi-project routing follows `--project <name>` flag → `NEAT_PROJECT` env → registry resolution (ADR-026).
+
+When neither the flag nor the env is set, the bare verb resolves its target from the daemon's registered projects (`GET /projects`) rather than blindly routing to `'default'` (issue #500 — `npx neat.is` registers under the cwd basename, so no `'default'` slot exists after a one-command run): exactly one registered project is used; a project literally named `'default'` keeps the legacy unprefixed routes; several registered with no `'default'` errors and lists them (exit 2, never a silent pick); none registered errors clearly. A daemon that can't be reached still exits 3 with the "is the daemon running?" message.
 
 The CLI client and the MCP client share the same REST helper module. One endpoint surface, two consumers.
 

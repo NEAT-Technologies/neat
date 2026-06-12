@@ -5888,8 +5888,16 @@ describe('CLI surface contract (ADR-050)', () => {
       req: import('node:http').IncomingMessage,
       res: import('node:http').ServerResponse,
     ): void => {
-      captures.push({ url: req.url ?? '' })
+      const url = req.url ?? ''
+      captures.push({ url })
       res.setHeader('content-type', 'application/json')
+      // The bare-verb path (no flag, no env) lists registered projects first
+      // (issue #500). A registered `default` keeps the legacy unprefixed route,
+      // which is exactly what step 3 below asserts.
+      if (url === '/projects') {
+        res.end(JSON.stringify([{ name: 'default' }]))
+        return
+      }
       res.end(JSON.stringify({ matches: [] }))
     }
 
@@ -5901,7 +5909,7 @@ describe('CLI surface contract (ADR-050)', () => {
       await withStubServer(stubHandler, async (baseUrl) => {
         process.env.NEAT_API_URL = baseUrl
 
-        // 1. Flag wins — even when env is set.
+        // 1. Flag wins — even when env is set. No /projects lookup needed.
         delete process.env.NEAT_PROJECT
         process.env.NEAT_PROJECT = 'env-proj'
         let parsed = parseArgs(['flag-proj-only', '--project', 'flag-proj'])
@@ -5909,13 +5917,14 @@ describe('CLI surface contract (ADR-050)', () => {
         expect(code).toBe(0)
         expect(captures[captures.length - 1]!.url).toContain('/projects/flag-proj/search')
 
-        // 2. Env used when no flag.
+        // 2. Env used when no flag. Still no /projects lookup.
         parsed = parseArgs(['somequery'])
         code = await runQueryVerb('search', parsed)
         expect(code).toBe(0)
         expect(captures[captures.length - 1]!.url).toContain('/projects/env-proj/search')
 
-        // 3. Neither set → unprefixed (server resolves to default).
+        // 3. Neither set, and a registered `default` exists → unprefixed
+        //    (server resolves it to default). Back-compat per issue #500.
         delete process.env.NEAT_PROJECT
         parsed = parseArgs(['stillquery'])
         code = await runQueryVerb('search', parsed)
@@ -6017,14 +6026,22 @@ describe('CLI surface contract (ADR-050)', () => {
   it('exit code 0 on success (ADR-050 #4)', async () => {
     const { runQueryVerb, parseArgs } = await import('../../src/cli.js')
     const stubHandler = (
-      _req: import('node:http').IncomingMessage,
+      req: import('node:http').IncomingMessage,
       res: import('node:http').ServerResponse,
     ): void => {
       res.setHeader('content-type', 'application/json')
+      // The bare verb resolves against the registry first (issue #500); one
+      // registered project lets it route and the search then returns clean.
+      if ((req.url ?? '') === '/projects') {
+        res.end(JSON.stringify([{ name: 'only-proj' }]))
+        return
+      }
       res.end(JSON.stringify({ matches: [] }))
     }
     const prevApi = process.env.NEAT_API_URL
+    const prevProject = process.env.NEAT_PROJECT
     const prevWrite = process.stdout.write
+    delete process.env.NEAT_PROJECT
     process.stdout.write = (() => true) as typeof process.stdout.write
     try {
       await withStubServer(stubHandler, async (baseUrl) => {
@@ -6037,6 +6054,8 @@ describe('CLI surface contract (ADR-050)', () => {
       process.stdout.write = prevWrite
       if (prevApi === undefined) delete process.env.NEAT_API_URL
       else process.env.NEAT_API_URL = prevApi
+      if (prevProject === undefined) delete process.env.NEAT_PROJECT
+      else process.env.NEAT_PROJECT = prevProject
     }
   })
 
