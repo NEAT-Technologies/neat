@@ -274,7 +274,14 @@ export async function spawnWebUI(
   // first connection triggers ensureStarted(), then every socket is piped
   // through to the internal Next server. A raw TCP proxy forwards SSE and any
   // other streaming response transparently.
+  // Live front-side sockets, so stop() can force them down. A raw net.Server
+  // has no http.Server-style closeAllConnections(), and its close() waits for
+  // every open connection to end on its own — which a browser dashboard's
+  // keep-alive / EventSource sockets never do (#518).
+  const liveSockets = new Set<net.Socket>()
   const front = net.createServer((socket) => {
+    liveSockets.add(socket)
+    socket.on('close', () => liveSockets.delete(socket))
     socket.on('error', () => socket.destroy())
     ensureStarted()
       .then(() => {
@@ -305,7 +312,17 @@ export async function spawnWebUI(
   async function stop(): Promise<void> {
     if (stopped) return
     stopped = true
-    await new Promise<void>((resolve) => front.close(() => resolve()))
+    await new Promise<void>((resolve) => {
+      front.close(() => resolve())
+      // `front.close()` only fires its callback once every existing connection
+      // has ended. The dashboard holds long-lived keep-alive / EventSource (SSE)
+      // sockets piped through this raw TCP front, and a live browser tab never
+      // drops them on its own — so destroy the live sockets here and the
+      // callback resolves promptly. Graceful stop then completes whether or not
+      // a dashboard tab is open.
+      for (const socket of liveSockets) socket.destroy()
+      liveSockets.clear()
+    })
     if (!child || !child.pid) return
     try {
       child.kill('SIGTERM')
