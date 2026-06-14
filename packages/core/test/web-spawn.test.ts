@@ -291,4 +291,60 @@ describe('spawnWebUI — per-project port + lazy spawn (ADR-096 §5, §7)', () =
       }),
     ).resolves.toBeUndefined()
   })
+
+  // #518 — net.Server.close() only fires its callback once every existing
+  // connection ends. A live dashboard holds keep-alive / EventSource sockets
+  // piped through the front that never close on their own, so stop() must drop
+  // them itself or the whole shutdown chain hangs (50s+ in the field). Assert
+  // stop() completes promptly with such a connection still open, and frees the
+  // port.
+  it('stop() completes promptly with a live proxied connection still open (#518)', async () => {
+    const root = await mkTmpProject()
+    tmpDirs.push(root)
+    const webPort = await freePort()
+    await writeDaemonJson(root, { ports: { rest: 8080, web: webPort } })
+    process.env.NEAT_SCAN_PATH = root
+    delete process.env.NEAT_WEB_PORT
+    const serverEntry = await writeStubServer(root)
+
+    const handle = await spawnWebUI(8080, { serverEntry, skipBuildCheck: true })
+    handles.push(handle)
+
+    // Hold a connection open through the front, piped to the upstream — the
+    // analogue of a browser tab's keep-alive / EventSource socket.
+    const sock = net.connect(handle.port, '127.0.0.1')
+    await new Promise<void>((resolve, reject) => {
+      sock.once('connect', () => resolve())
+      sock.once('error', reject)
+    })
+    sock.write('GET / HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n')
+    // Wait for the front to spawn the upstream and pipe the socket through.
+    for (let i = 0; i < 80 && !handle.started(); i++) {
+      await new Promise((r) => setTimeout(r, 50))
+    }
+    expect(handle.started()).toBe(true)
+
+    // Without forcing the live socket down, front.close() never resolves and
+    // stop() hangs. Assert it finishes well inside that window.
+    const outcome = await Promise.race([
+      handle.stop().then(() => 'stopped' as const),
+      new Promise<'timeout'>((r) => setTimeout(() => r('timeout'), 3000)),
+    ])
+    expect(outcome).toBe('stopped')
+
+    // The front port is freed despite the still-open client socket.
+    await expect(
+      new Promise<void>((resolve, reject) => {
+        const s = net.createServer()
+        s.once('error', reject)
+        s.listen(webPort, '127.0.0.1', () => s.close(() => resolve()))
+      }),
+    ).resolves.toBeUndefined()
+
+    try {
+      sock.destroy()
+    } catch {
+      /* already gone */
+    }
+  }, 20000)
 })
