@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { EdgeType, NodeType, Provenance } from '@neat.is/types'
 import { HttpError, type HttpClient } from '../src/client.js'
 import {
+  checkPolicies,
   getBlastRadius,
   getDependencies,
   getGraphDiff,
@@ -9,6 +10,12 @@ import {
   getObservedDependencies,
   getRecentStaleEdges,
   getRootCause,
+  neatApplyExtension,
+  neatDescribeProjectInstrumentation,
+  neatDryRunExtension,
+  neatListUninstrumented,
+  neatLookupInstrumentation,
+  neatRollbackExtension,
   semanticSearch,
 } from '../src/tools.js'
 
@@ -46,6 +53,57 @@ function errorClient(err: Error): HttpClient {
   return {
     async get<T>(): Promise<T> {
       throw err
+    },
+  }
+}
+
+// A client whose POST rejects — the transport-error stub for the wrappers that
+// go through HttpClient.post (check_policies dry-run, apply, dry-run, rollback).
+// GET also rejects so it doubles for any path.
+function postErrorClient(err: Error): HttpClient {
+  return {
+    async get<T>(): Promise<T> {
+      throw err
+    },
+    async post<T>(): Promise<T> {
+      throw err
+    },
+  }
+}
+
+interface PostCapture {
+  // Each POST records its path and the body it was handed so tests can assert
+  // both routing and the JSON the wrapper forwarded.
+  calls: { path: string; body: unknown }[]
+}
+
+// Like clientFor but also wires a POST handler. check_policies' dry-run and the
+// three operative extend wrappers (apply / dry-run / rollback) go through
+// HttpClient.post; the GET-only stub above can't exercise them.
+function postClientFor(
+  getMap: Record<string, unknown>,
+  postMap: Record<string, unknown>,
+  capture: PostCapture = { calls: [] },
+): { client: HttpClient; capture: PostCapture; getCapture: Capture } {
+  const getCapture: Capture = { paths: [] }
+  return {
+    capture,
+    getCapture,
+    client: {
+      async get<T>(path: string): Promise<T> {
+        getCapture.paths.push(path)
+        const decoded = decodePath(path)
+        if (decoded in getMap) return getMap[decoded] as T
+        if (path in getMap) return getMap[path] as T
+        throw new HttpError(404, `404 on GET ${path}`)
+      },
+      async post<T>(path: string, body: unknown): Promise<T> {
+        capture.calls.push({ path, body })
+        const decoded = decodePath(path)
+        if (decoded in postMap) return postMap[decoded] as T
+        if (path in postMap) return postMap[path] as T
+        throw new HttpError(404, `404 on POST ${path}`)
+      },
     },
   }
 }
@@ -632,5 +690,432 @@ describe('project routing', () => {
     })
     await getRootCause(client, { errorNode: 'database:payments-db' })
     expect(capture.paths[0]).toBe('/graph/root-cause/database%3Apayments-db')
+  })
+})
+
+describe('checkPolicies', () => {
+  // A representative violation. The fields the formatter actually reads are
+  // severity, onViolation, policyName, message, and the subject's nodeId.
+  function violation(over: Partial<Record<string, unknown>> = {}): unknown {
+    return {
+      id: 'no-frontier-calls:service:checkout',
+      policyId: 'no-frontier-calls',
+      policyName: 'No FRONTIER calls into prod',
+      severity: 'high',
+      onViolation: 'block',
+      ruleType: 'provenance',
+      subject: { nodeId: 'service:checkout' },
+      message: 'service:checkout has an unresolved FRONTIER dependency',
+      observedAt: '2026-05-02T11:00:00.000Z',
+      ...over,
+    }
+  }
+
+  it('reads current violations from GET /policies/violations and formats them', async () => {
+    const { client, getCapture } = postClientFor(
+      { '/policies/violations': { violations: [violation()] } },
+      {},
+    )
+    const res = await checkPolicies(client, {})
+    expect(res.isError).toBeFalsy()
+    const text = res.content[0].text
+    expect(text).toContain('1 policy violation currently recorded')
+    expect(text).toContain('1 of which block')
+    expect(text).toContain('[high/block] No FRONTIER calls into prod')
+    expect(text).toContain('service:checkout')
+    // Confirmed (non-hypothetical) violations report confidence 1.00.
+    expect(text).toMatch(/confidence: 1\.00 · provenance: high/)
+    expect(getCapture.paths[0]).toBe('/policies/violations')
+  })
+
+  it('narrows to a single policy via the scope.policyId query param', async () => {
+    const { client, getCapture } = postClientFor(
+      { '/policies/violations?policyId=no-frontier-calls': { violations: [] } },
+      {},
+    )
+    const res = await checkPolicies(client, { scope: { policyId: 'no-frontier-calls' } })
+    expect(getCapture.paths[0]).toBe('/policies/violations?policyId=no-frontier-calls')
+    expect(res.content[0].text).toContain('No policy violations recorded')
+  })
+
+  it('dry-runs a hypothetical action via POST /policies/check', async () => {
+    const { client, capture } = postClientFor(
+      {},
+      {
+        '/policies/check': {
+          allowed: false,
+          hypotheticalAction: { kind: 'add-edge', source: 'service:a', target: 'service:b', edgeType: EdgeType.CALLS, provenance: Provenance.OBSERVED },
+          violations: [violation({ severity: 'critical' })],
+        },
+      },
+    )
+    const action = {
+      kind: 'add-edge' as const,
+      source: 'service:a',
+      target: 'service:b',
+      edgeType: EdgeType.CALLS,
+      provenance: Provenance.OBSERVED,
+    }
+    const res = await checkPolicies(client, { hypotheticalAction: action })
+    const text = res.content[0].text
+    expect(capture.calls[0].path).toBe('/policies/check')
+    // The wrapper forwards the action under hypotheticalAction in the body.
+    expect(capture.calls[0].body).toEqual({ hypotheticalAction: action })
+    expect(text).toContain('Hypothetical add-edge would surface 1 violation')
+    expect(text).toContain('action denied')
+    // Hypothetical results are capped at 0.7 confidence.
+    expect(text).toMatch(/confidence: 0\.70/)
+  })
+
+  it('reports no violations would result from a clean hypothetical', async () => {
+    const { client } = postClientFor(
+      {},
+      {
+        '/policies/check': {
+          allowed: true,
+          hypotheticalAction: { kind: 'promote-frontier', frontierId: 'frontier:api:8080' },
+          violations: [],
+        },
+      },
+    )
+    const res = await checkPolicies(client, {
+      hypotheticalAction: { kind: 'promote-frontier', frontierId: 'frontier:api:8080' },
+    })
+    expect(res.content[0].text).toContain(
+      'No violations would result from the hypothetical action (promote-frontier)',
+    )
+  })
+
+  it('threads project into both the GET and the POST path', async () => {
+    const { client, getCapture, capture } = postClientFor(
+      { '/projects/alpha/policies/violations': { violations: [] } },
+      {
+        '/projects/alpha/policies/check': {
+          allowed: true,
+          hypotheticalAction: { kind: 'promote-frontier', frontierId: 'frontier:x:1' },
+          violations: [],
+        },
+      },
+    )
+    await checkPolicies(client, { project: 'alpha' })
+    await checkPolicies(client, {
+      project: 'alpha',
+      hypotheticalAction: { kind: 'promote-frontier', frontierId: 'frontier:x:1' },
+    })
+    expect(getCapture.paths[0]).toBe('/projects/alpha/policies/violations')
+    expect(capture.calls[0].path).toBe('/projects/alpha/policies/check')
+  })
+
+  it('surfaces a transport error as isError', async () => {
+    const res = await checkPolicies(errorClient(new Error('connect ECONNREFUSED')), {})
+    expect(res.isError).toBe(true)
+    expect(res.content[0].text).toContain('ECONNREFUSED')
+  })
+})
+
+describe('neatListUninstrumented', () => {
+  it('lists libraries needing instrumentation with their registry package', async () => {
+    const { client, getCapture } = postClientFor(
+      {
+        '/extend/list-uninstrumented': {
+          libraries: [
+            {
+              library: '@prisma/client',
+              coverage: 'registry',
+              instrumentation_package: '@prisma/instrumentation',
+              package_version: '^6.0.0',
+              notes: 'needs PrismaInstrumentation()',
+            },
+            { library: 'left-pad', coverage: 'none' },
+          ],
+        },
+      },
+      {},
+    )
+    const res = await neatListUninstrumented(client, {})
+    const text = res.content[0].text
+    expect(text).toContain('2 libraries need instrumentation')
+    expect(text).toContain('@prisma/client [registry] → @prisma/instrumentation@^6.0.0')
+    expect(text).toContain('needs PrismaInstrumentation()')
+    expect(text).toContain('left-pad [none] → no registry entry')
+    expect(getCapture.paths[0]).toBe('/extend/list-uninstrumented')
+  })
+
+  it('returns a friendly message when everything is covered', async () => {
+    const { client } = postClientFor({ '/extend/list-uninstrumented': { libraries: [] } }, {})
+    const res = await neatListUninstrumented(client, {})
+    expect(res.content[0].text).toContain('All detected libraries are covered')
+  })
+
+  it('routes through the project prefix', async () => {
+    const { client, getCapture } = postClientFor(
+      { '/projects/alpha/extend/list-uninstrumented': { libraries: [] } },
+      {},
+    )
+    await neatListUninstrumented(client, { project: 'alpha' })
+    expect(getCapture.paths[0]).toBe('/projects/alpha/extend/list-uninstrumented')
+  })
+
+  it('surfaces a transport error as isError', async () => {
+    const res = await neatListUninstrumented(errorClient(new Error('boom')), {})
+    expect(res.isError).toBe(true)
+    expect(res.content[0].text).toContain('boom')
+  })
+})
+
+describe('neatLookupInstrumentation', () => {
+  it('formats a registry hit with package, registration, and notes', async () => {
+    const { client, getCapture } = postClientFor(
+      {
+        '/extend/lookup?library=%40prisma%2Fclient': {
+          library: '@prisma/client',
+          coverage: 'registry',
+          instrumentation_package: '@prisma/instrumentation',
+          package_version: '^6.0.0',
+          registration: 'instrumentations.push(new PrismaInstrumentation())',
+          notes: 'supported since 5.x',
+        },
+      },
+      {},
+    )
+    const res = await neatLookupInstrumentation(client, { library: '@prisma/client' })
+    const text = res.content[0].text
+    expect(text).toContain('Registry entry for @prisma/client: coverage is registry')
+    expect(text).toContain('instrumentation_package: @prisma/instrumentation@^6.0.0')
+    expect(text).toContain('registration: instrumentations.push(new PrismaInstrumentation())')
+    expect(text).toContain('notes: supported since 5.x')
+    expect(getCapture.paths[0]).toBe('/extend/lookup?library=%40prisma%2Fclient')
+  })
+
+  it('threads installedVersion through as a version query param', async () => {
+    const { client, getCapture } = postClientFor(
+      {
+        '/extend/lookup?library=%40prisma%2Fclient&version=6.2.0': {
+          library: '@prisma/client',
+          coverage: 'registry',
+        },
+      },
+      {},
+    )
+    await neatLookupInstrumentation(client, { library: '@prisma/client', installedVersion: '6.2.0' })
+    expect(getCapture.paths[0]).toBe(
+      '/extend/lookup?library=%40prisma%2Fclient&version=6.2.0',
+    )
+  })
+
+  it('returns a friendly not-in-registry message on 404', async () => {
+    const { client } = postClientFor({}, {})
+    const res = await neatLookupInstrumentation(client, { library: 'nope' })
+    expect(res.isError).toBeFalsy()
+    expect(res.content[0].text).toContain('nope is not in the instrumentation registry')
+  })
+
+  it('surfaces a non-404 transport error as isError', async () => {
+    const res = await neatLookupInstrumentation(errorClient(new Error('ECONNREFUSED')), {
+      library: 'x',
+    })
+    expect(res.isError).toBe(true)
+    expect(res.content[0].text).toContain('ECONNREFUSED')
+  })
+})
+
+describe('neatDescribeProjectInstrumentation', () => {
+  it('describes hook files, .env.neat, and installed deps when ready', async () => {
+    const { client, getCapture } = postClientFor(
+      {
+        '/extend/describe': {
+          hookFiles: ['neat-out/otel-init.cjs'],
+          envNeat: true,
+          installedDeps: { '@opentelemetry/sdk-node': '^0.50.0' },
+        },
+      },
+      {},
+    )
+    const res = await neatDescribeProjectInstrumentation(client, {})
+    const text = res.content[0].text
+    expect(text).toContain('Project has 1 instrumentation hook file and is ready')
+    expect(text).toContain('neat-out/otel-init.cjs')
+    expect(text).toContain('.env.neat:      present')
+    expect(text).toContain('@opentelemetry/sdk-node@^0.50.0')
+    expect(getCapture.paths[0]).toBe('/extend/describe')
+  })
+
+  it('tells the agent to run neat init when no hook files exist', async () => {
+    const { client } = postClientFor(
+      {
+        '/extend/describe': { hookFiles: [], envNeat: false, installedDeps: {} },
+      },
+      {},
+    )
+    const res = await neatDescribeProjectInstrumentation(client, {})
+    const text = res.content[0].text
+    expect(text).toContain('Run neat init before extending')
+    expect(text).toContain('installed OTel deps: (none)')
+  })
+
+  it('surfaces a transport error as isError', async () => {
+    const res = await neatDescribeProjectInstrumentation(errorClient(new Error('down')), {})
+    expect(res.isError).toBe(true)
+    expect(res.content[0].text).toContain('down')
+  })
+})
+
+describe('neatApplyExtension', () => {
+  const applyInput = {
+    library: '@prisma/client',
+    instrumentation_package: '@prisma/instrumentation',
+    version: '^6.0.0',
+    registration_snippet: 'instrumentations.push(new PrismaInstrumentation())',
+  }
+
+  it('POSTs to /extend/apply and formats the applied result', async () => {
+    const { client, capture } = postClientFor(
+      {},
+      {
+        '/extend/apply': {
+          library: '@prisma/client',
+          filesTouched: ['neat-out/otel-init.cjs', 'package.json'],
+          depsAdded: ['@prisma/instrumentation@^6.0.0'],
+          installOutput: 'added 1 package',
+          alreadyApplied: false,
+        },
+      },
+    )
+    const res = await neatApplyExtension(client, applyInput)
+    const text = res.content[0].text
+    expect(capture.calls[0].path).toBe('/extend/apply')
+    // The wrapper forwards exactly the four registry fields, no project.
+    expect(capture.calls[0].body).toEqual({
+      library: '@prisma/client',
+      instrumentation_package: '@prisma/instrumentation',
+      version: '^6.0.0',
+      registration_snippet: 'instrumentations.push(new PrismaInstrumentation())',
+    })
+    expect(text).toContain('Applied @prisma/instrumentation for @prisma/client. 2 files touched')
+    expect(text).toContain('neat-out/otel-init.cjs, package.json')
+    expect(text).toContain('@prisma/instrumentation@^6.0.0')
+  })
+
+  it('reports an idempotent no-op when already applied', async () => {
+    const { client } = postClientFor(
+      {},
+      {
+        '/extend/apply': {
+          library: '@prisma/client',
+          filesTouched: [],
+          depsAdded: [],
+          installOutput: '',
+          alreadyApplied: true,
+        },
+      },
+    )
+    const res = await neatApplyExtension(client, applyInput)
+    expect(res.content[0].text).toContain('already applied — no changes made')
+  })
+
+  it('routes through the project prefix', async () => {
+    const { client, capture } = postClientFor(
+      {},
+      {
+        '/projects/alpha/extend/apply': {
+          library: '@prisma/client',
+          filesTouched: ['x'],
+          depsAdded: [],
+          installOutput: '',
+          alreadyApplied: false,
+        },
+      },
+    )
+    await neatApplyExtension(client, { ...applyInput, project: 'alpha' })
+    expect(capture.calls[0].path).toBe('/projects/alpha/extend/apply')
+  })
+
+  it('surfaces a transport error as isError', async () => {
+    const res = await neatApplyExtension(postErrorClient(new Error('install failed')), applyInput)
+    expect(res.isError).toBe(true)
+    expect(res.content[0].text).toContain('install failed')
+  })
+})
+
+describe('neatDryRunExtension', () => {
+  const dryInput = {
+    library: '@prisma/client',
+    instrumentation_package: '@prisma/instrumentation',
+    version: '^6.0.0',
+    registration_snippet: 'instrumentations.push(new PrismaInstrumentation())',
+  }
+
+  it('POSTs to /extend/dry-run and formats the preview without applying', async () => {
+    const { client, capture } = postClientFor(
+      {},
+      {
+        '/extend/dry-run': {
+          library: '@prisma/client',
+          filesTouched: ['neat-out/otel-init.cjs'],
+          depsToAdd: ['@prisma/instrumentation@^6.0.0'],
+          packageJsonPatch: { dependencies: { '@prisma/instrumentation': '^6.0.0' } },
+          templatePatch: '+ instrumentations.push(new PrismaInstrumentation())',
+        },
+      },
+    )
+    const res = await neatDryRunExtension(client, dryInput)
+    const text = res.content[0].text
+    expect(capture.calls[0].path).toBe('/extend/dry-run')
+    expect(capture.calls[0].body).toEqual(dryInput)
+    expect(text).toContain('Dry run for @prisma/client: 1 file would be touched. No changes made.')
+    expect(text).toContain('deps to add:                 @prisma/instrumentation@^6.0.0')
+    expect(text).toContain('+ instrumentations.push(new PrismaInstrumentation())')
+  })
+
+  it('surfaces a transport error as isError', async () => {
+    const res = await neatDryRunExtension(postErrorClient(new Error('nope')), dryInput)
+    expect(res.isError).toBe(true)
+    expect(res.content[0].text).toContain('nope')
+  })
+})
+
+describe('neatRollbackExtension', () => {
+  it('POSTs to /extend/rollback and confirms the undo', async () => {
+    const { client, capture } = postClientFor(
+      {},
+      {
+        '/extend/rollback': {
+          undone: true,
+          message: 'removed @prisma/instrumentation and its registration',
+        },
+      },
+    )
+    const res = await neatRollbackExtension(client, { library: '@prisma/client' })
+    const text = res.content[0].text
+    expect(capture.calls[0].path).toBe('/extend/rollback')
+    expect(capture.calls[0].body).toEqual({ library: '@prisma/client' })
+    expect(text).toContain('Rolled back instrumentation for @prisma/client')
+    expect(text).toContain('removed @prisma/instrumentation and its registration')
+  })
+
+  it('reports nothing to roll back when no prior apply exists', async () => {
+    const { client } = postClientFor(
+      {},
+      { '/extend/rollback': { undone: false, message: 'no log entry' } },
+    )
+    const res = await neatRollbackExtension(client, { library: '@prisma/client' })
+    expect(res.content[0].text).toContain('No prior apply found for @prisma/client')
+  })
+
+  it('routes through the project prefix', async () => {
+    const { client, capture } = postClientFor(
+      {},
+      { '/projects/alpha/extend/rollback': { undone: true, message: 'done' } },
+    )
+    await neatRollbackExtension(client, { library: '@prisma/client', project: 'alpha' })
+    expect(capture.calls[0].path).toBe('/projects/alpha/extend/rollback')
+  })
+
+  it('surfaces a transport error as isError', async () => {
+    const res = await neatRollbackExtension(postErrorClient(new Error('kaboom')), {
+      library: 'x',
+    })
+    expect(res.isError).toBe(true)
+    expect(res.content[0].text).toContain('kaboom')
   })
 })
