@@ -82,6 +82,10 @@ export function GraphCanvas({
   const [loading, setLoading] = useState(true)
   const [observedCount, setObservedCount] = useState(0)
   const [overlay, setOverlay] = useState<{ mode: ObservedMode } | null>(null)
+  // Once the operator dismisses the overlay for a project, it stays dismissed —
+  // a re-resolve / reload (effect re-run on [project]) must not resurrect it.
+  // Keyed by project so switching projects re-evaluates honestly.
+  const dismissedForRef = useRef<string | null>(null)
   const [hoverTip, setHoverTip] = useState<{ x: number; y: number; text: string } | null>(null)
 
   // -- cytoscape style ------------------------------------------------------
@@ -462,7 +466,8 @@ export function GraphCanvas({
       renderAll()
       setLoading(false)
 
-      if (obs === 0) void resolveOverlayMode(proj).then((m) => setOverlay({ mode: m }))
+      if (obs === 0 && dismissedForRef.current !== proj)
+        void resolveOverlayMode(proj).then((m) => setOverlay({ mode: m }))
 
       function focusNode(id: string) {
         cy.elements().removeClass('hl dim')
@@ -669,7 +674,14 @@ export function GraphCanvas({
       </aside>
 
       {overlay && (
-        <ObservedOverlay mode={overlay.mode} project={project} onDismiss={() => setOverlay(null)} />
+        <ObservedOverlay
+          mode={overlay.mode}
+          project={project}
+          onDismiss={() => {
+            dismissedForRef.current = project
+            setOverlay(null)
+          }}
+        />
       )}
     </main>
   )

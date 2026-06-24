@@ -60,8 +60,21 @@ export function ObservedOverlay({ mode, project, onDismiss }: ObservedOverlayPro
   }, [mode, project])
 
   return (
-    <div className="observed-overlay" role="dialog" aria-label="Live layer status">
-      <div className="oo-card">
+    <div
+      className="observed-overlay"
+      role="dialog"
+      aria-label="Live layer status"
+      onClick={onDismiss}
+    >
+      <div className="oo-card" onClick={(e) => e.stopPropagation()}>
+        <button
+          className="oo-close"
+          onClick={onDismiss}
+          aria-label="Dismiss and explore the static graph"
+          title="Explore the static graph"
+        >
+          ×
+        </button>
         {/* completion meter — incomplete → completing → complete. With no
             OBSERVED data the picture is "extracted, not yet whole". */}
         <div className="oo-meter" aria-hidden="true">

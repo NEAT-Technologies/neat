@@ -1344,10 +1344,20 @@ a:focus-visible, button:focus-visible {
 }
 .oo-card {
   width: min(560px, 86%);
+  max-height: 86vh; overflow-y: auto;
   background: var(--bg); border: 1px solid var(--rule);
   padding: 40px 44px 36px;
   position: relative;
 }
+.oo-close {
+  position: absolute; top: 10px; right: 12px;
+  width: 28px; height: 28px; line-height: 1;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 1.15rem; color: var(--fg-muted);
+  background: transparent; border: 1px solid transparent; cursor: pointer;
+  transition: color 0.16s ease, border-color 0.16s ease;
+}
+.oo-close:hover { color: var(--fg); border-color: var(--rule); }
 .oo-meter { height: 2px; width: 100%; background: var(--rule); margin-bottom: 26px; position: relative; overflow: hidden; }
 .oo-meter-fill { position: absolute; left: 0; top: 0; bottom: 0; }
 .oo-meter-fill[data-state="idle"] { width: 62%; background: var(--fg-muted); animation: livePulse 2.4s ease-in-out infinite; }
