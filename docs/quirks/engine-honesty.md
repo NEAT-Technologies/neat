@@ -76,7 +76,9 @@ only — a maintainer-scope decision, same boundary #547 drew).
    `require('node:fs')` block). It predates this work and is unrelated to it;
    `turbo lint` passes (0 errors). Not touched to avoid scope creep.
 
-7. **`looksLikeWebApp` kept as a thin alias.** It's now implemented over
-   `appFrameworkDependencies` and no longer imported by the orchestrator, but
-   left exported for back-compat. It's technically an unused export now; safe to
-   remove in a later cleanup if nothing external depends on it.
+7. **`looksLikeWebApp` removed.** The orchestrator switched to
+   `appFrameworkDependencies` (the richer form that names what it found), which
+   left `looksLikeWebApp` as a thin alias imported by nothing — not the
+   orchestrator, not the installer index, not the tests. It was dead code this
+   change created, so it's gone rather than left as a back-compat stub; the
+   contract already references `appFrameworkDependencies` as the signal.

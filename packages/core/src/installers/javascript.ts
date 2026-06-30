@@ -384,14 +384,6 @@ export function appFrameworkDependencies(pkg: PackageJsonShape): string[] {
   return APP_FRAMEWORK_DEPS.filter((name) => name in deps)
 }
 
-// True when the package declares a web- or worker-framework dependency — the
-// signal that a lib-only classification is more likely a missed app entry than
-// a real library. Retained for the existing call sites; `appFrameworkDependencies`
-// is the richer form the orchestrator uses to name what it found.
-export function looksLikeWebApp(pkg: PackageJsonShape): boolean {
-  return appFrameworkDependencies(pkg).length > 0
-}
-
 // Issue #546 — libraries whose calls aren't observed by the default
 // auto-instrumentation set. Resolved through the instrumentation registry (the
 // single source of truth, contract §3) rather than a hardcoded list: a
