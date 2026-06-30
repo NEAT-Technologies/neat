@@ -31,7 +31,13 @@ scaffold a backend + inject bugs → install latest NEAT → run NEAT on it (ini
 - **RUN #1 status:** real bug found → fixed → on a reviewable PR. Flow-blocker closed.
 - **RUN #2 (HARVEST) — a goldmine.** Scaffolded a 2-service Express + better-sqlite3 app with 4 planted bugs, ran NEAT (built w/ the #574 fix, Node 20), drove 225 requests. Full report: [`reports/run2-harvest.md`](./reports/run2-harvest.md). NEAT caught **1 of 4** planted bugs (the dynamic-dispatch `missing-extracted` — its clean fusion win) and surfaced **~13 real NEAT defects**. Headlines: divergence flood (structural edges as `missing-observed`, 13 false positives), root-cause blind to the incident store, OBSERVED near-zero for inbound/in-process work, DB connection strings unextracted. The honest verdict: **precision and OBSERVED coverage are NEAT's headline problems** — an agent acting on today's divergence surface chases phantoms.
 - **RUN #2 issues filed:** #576 (OBSERVED inbound coverage), #577 (frontier dup), #578 (observed-deps), #579 (CLI daemon resolution), #580 (IPv6 bind) — tracked, architectural / next-wave.
-- **RUN #2 fix wave (parallel, on staging):** 4 worktree agents — **divergence-precision** (A), **root-cause-incidents** (B+D+F), **db-config-extraction** (E), **orchestrator-dx** (J+M) — each files its issue + a `staging/fix-*` PR with a test. In flight.
+- **RUN #2 fix wave — landed, all CI-green:**
+  - #581 → **PR #583** — divergence precision: `missing-observed` now gates on a runtime-observable allowlist (CALLS/CONNECTS_TO/PUBLISHES_TO/CONSUMES_FROM), so IMPORTS/CONFIGURED_BY stop flooding.
+  - #584 → **PR #588** — root-cause now consults the incident store + attributes to file:line/route + real "500 on GET …" messages.
+  - #586 → **PR #587** — service `dbConnectionTarget` populated + service-level CONFIGURED_BY → `host-mismatch` reachable. (Root cause was structural, not a parse gap — the gate required an edge file-grained extraction never emits.)
+  - #582 → **PR #585** — readiness gate scoped to the just-started project (a broken sibling no longer poisons every run) + grammar fix.
+- **Env quirk (folded into repo-env-quirks):** worktrees share root `node_modules` whose `@neat.is/types` dist is stale (missing `ApplicablePolicy` from the unmerged #573) → `turbo` DTS build fails locally; agents ran `vitest` directly. CI (fresh install) is unaffected — all four PRs pass.
+- **RUN #3 (integration + verification) in flight:** assemble `staging/release-0.4.21` = `main` + #574 + the 4 run-#2 fixes (Node 20 build), then re-harvest to confirm the headline defects (divergence flood, root-cause, DB host-mismatch, readiness) are actually resolved end-to-end — not just unit-green.
 
 ## Open items / blockers
 
