@@ -31,6 +31,10 @@ When the first positional argument resolves to a directory and does **not** matc
 5. Browser open against the web UI (per [`web-bootstrap.md`](./web-bootstrap.md)).
 6. Summary block — what landed on disk, plus the OTel env-vars block the operator pastes into their deploy platform (matches §5 below).
 
+The orchestrator is a **run-once command that returns the prompt**. It spawns the daemon fully detached — its own session, `unref`'d — with stdout and stderr redirected to `<project>/neat-out/daemon.log`, never inherited from the caller. The daemon keeps running in the background exactly as [`project-daemon.md`](./project-daemon.md) describes (binds, serves REST/OTLP/dashboard, steps ports, writes `daemon.json`, reconciles on exit); the caller prints its summary and hands the terminal back cleanly, so the daemon's ongoing logs never stream into the operator's shell. Daemon startup faults — a `BindAuthorityError`, a bind collision — land in the log file; the orchestrator's own `/health` readiness poll is what surfaces a failed start to the operator, pointing at `neat-out/daemon.log` for the detail.
+
+The summary block closes with the onboarding signpost: the daemon is running, where its log lives, and the honest next step — run the operator's **own app or test suite** so OBSERVED edges fill in as it executes and divergences surface where code and runtime disagree. It never suggests generating synthetic traffic.
+
 Defaults: instrument yes, open dashboard yes. Overrides:
 
 - `--no-instrument` — skip step 3. Useful for read-only first-look runs.
