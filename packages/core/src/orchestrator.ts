@@ -749,12 +749,23 @@ export function waitForDaemonReadyForTest(
   return waitForDaemonReady(restPort, project, timeoutMs)
 }
 
-// Spawn the daemon as a child process the orchestrator drives. Returns the
-// child handle so the caller can read its stderr verbatim when the bind
-// gate (or any other startup failure) reports back through that pipe
-// (issue #341). The `detached: true` + `unref()` pair survives the
-// orchestrator exiting cleanly; the inherited stderr keeps the operator
-// informed when something does fail.
+// Where a project's daemon writes its stdout/stderr. Lives beside the
+// snapshot under the project's own `neat-out/` so the operator finds it next
+// to everything else NEAT wrote for that project.
+export function daemonLogPath(projectPath: string): string {
+  return path.join(projectPath, 'neat-out', 'daemon.log')
+}
+
+// Spawn the daemon as a fully detached background process and hand the terminal
+// back. `detached: true` puts it in its own session and `unref()` lets the
+// orchestrator exit cleanly the moment its own work is done — the one-command
+// flow prints its summary and returns the prompt (#639/#529). The daemon's
+// stdout and stderr go to `<project>/neat-out/daemon.log`, never the caller's
+// fds: an inherited stderr keeps the shell attached and streams the daemon's
+// ongoing logs into the operator's terminal indefinitely. Startup faults (a
+// `BindAuthorityError`, a bind collision) land in that log; the caller's
+// `/health` readiness poll is what tells the operator a start failed, and
+// points them at the log for the detail.
 //
 // ADR-096 — when `spec` is given the daemon is spawned scoped to that one
 // project on the allocated ports (passed through the env neatd + startDaemon
@@ -819,15 +830,27 @@ function spawnDaemonDetached(
     env.NEAT_WEB_PORT = String(spec.ports.web)
   }
 
+  // Redirect the daemon's output to a log file rather than inheriting the
+  // caller's fds (#639/#529). Inherited stderr keeps the shell attached — the
+  // prompt never returns and the daemon's ongoing warnings spill into the
+  // operator's terminal. A per-project `neat-out/daemon.log` keeps the output
+  // reachable without holding the terminal. We open once and hand the same fd
+  // to stdout and stderr; the OS dups it into the child at spawn, so the parent
+  // closes its copy right after. With no spec (legacy multi-project form) there
+  // is no project dir to write into, so output is discarded.
+  let logFd: number | null = null
+  if (spec) {
+    const logPath = daemonLogPath(spec.projectPath)
+    fsSync.mkdirSync(path.dirname(logPath), { recursive: true })
+    logFd = fsSync.openSync(logPath, 'a')
+  }
   const child = spawn(process.execPath, [entry, 'start'], {
     detached: true,
-    // stderr inherits the orchestrator's fd so the daemon's
-    // `BindAuthorityError` message lands in front of the operator instead
-    // of being swallowed (issue #341).
-    stdio: ['ignore', 'ignore', 'inherit'],
+    stdio: ['ignore', logFd ?? 'ignore', logFd ?? 'ignore'],
     env,
   })
   child.unref()
+  if (logFd !== null) fsSync.closeSync(logFd)
   return child
 }
 
@@ -1091,8 +1114,18 @@ export async function runOrchestrator(opts: OrchestratorOptions): Promise<Orches
     result.steps.browser = openBrowser(dashboardUrl)
   }
 
-  // ── Step 6: summary (stub — PR 4 replaces with the value-forward shape)
-  printSummary(result, graph, dashboardUrl)
+  // ── Step 6: summary + onboarding signpost ────────────────────────────
+  // The daemon runs in the background writing to its own log; point the
+  // operator at it and at the honest next step (run their own app/tests).
+  const daemonRunning =
+    result.steps.daemon === 'spawned' || result.steps.daemon === 'already-running'
+  // Show the log path relative to the project root — the summary already
+  // printed the project path up top, so `neat-out/daemon.log` reads cleanly
+  // and matches what the operator sees on disk.
+  const daemonLog = daemonRunning
+    ? path.relative(opts.scanPath, daemonLogPath(opts.scanPath))
+    : null
+  printSummary(result, graph, dashboardUrl, daemonLog)
 
   return result
 }
@@ -1101,6 +1134,7 @@ function printSummary(
   result: OrchestratorResult,
   graph: ReturnType<typeof getGraph>,
   dashboardUrl: string,
+  daemonLog: string | null,
 ): void {
   const nodes: GraphNode[] = []
   graph.forEachNode((_id, attrs) => nodes.push(attrs))
@@ -1130,5 +1164,20 @@ function printSummary(
     console.log(`auth token: ${token}`)
   } else {
     console.log('running locally — open the dashboard, no token needed')
+  }
+
+  // Onboarding signpost — the one-command flow returns here, so the last thing
+  // the operator reads has to tell them the daemon is up (and where its log is)
+  // and what to do next. The honest next step is to run their own app or test
+  // suite: the graph fills its OBSERVED layer as their code executes, and
+  // divergences surface where code and runtime disagree. Never suggest
+  // synthetic traffic — the point is what their real system does.
+  if (daemonLog !== null) {
+    console.log('')
+    console.log(`daemon running in the background (logs: ${daemonLog})`)
+    console.log(
+      'next: run your app or your test suite — OBSERVED edges fill in as it executes,',
+    )
+    console.log('      and divergences surface where code and runtime disagree.')
   }
 }

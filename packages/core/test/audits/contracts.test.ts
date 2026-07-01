@@ -10329,10 +10329,24 @@ describe('ADR-073 — one-command CLI + deployment-target + delegated auth', () 
     const orchestrator = readFileSync(join(CORE_SRC, 'orchestrator.ts'), 'utf8')
     expect(orchestrator).toMatch(/NEAT_AUTH_TOKEN/)
     expect(orchestrator).toMatch(/env\.HOST\s*=\s*'127\.0\.0\.1'/)
-    // The daemon's stderr inherits the orchestrator's so the
-    // BindAuthorityError message reaches the operator instead of being
-    // swallowed.
-    expect(orchestrator).toMatch(/stdio:\s*\[[^\]]*'inherit'[^\]]*\]/)
+  })
+
+  it('#639/#529 — the one-command flow returns the prompt: daemon detached, output to a log file, never inherited', () => {
+    // The daemon runs in the background and the caller returns. Inheriting the
+    // caller's stderr keeps the shell attached — the prompt never comes back
+    // and the daemon's ongoing logs stream into the terminal. So the spawn
+    // stays `detached` + `unref`'d and redirects stdout/stderr to the project's
+    // `neat-out/daemon.log` rather than inheriting them.
+    const orchestrator = readFileSync(join(CORE_SRC, 'orchestrator.ts'), 'utf8')
+    expect(orchestrator).toMatch(/detached:\s*true/)
+    expect(orchestrator).toMatch(/daemonLogPath\(/)
+    expect(orchestrator).toMatch(/['"]neat-out['"]\s*,\s*['"]daemon\.log['"]/)
+    // The daemon's stdio must not inherit the caller's fds anymore.
+    expect(orchestrator).not.toMatch(/stdio:\s*\[[^\]]*'inherit'[^\]]*\]/)
+    // The summary points the operator at their own app/tests, never synthetic
+    // traffic, and names where the log lives.
+    expect(orchestrator).toMatch(/OBSERVED edges fill in/)
+    expect(orchestrator).toMatch(/run your app or your test suite/)
   })
 
   it('ADR-073 §3 — NEAT_AUTH_TOKEN unset + loopback bind: daemon starts unauthenticated (laptop dev path)', async () => {
