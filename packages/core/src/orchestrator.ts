@@ -530,13 +530,58 @@ export const NEAT_PORTS = [8080, 4318, 6328] as const
 // binds the wildcard reads a wildcard-held port as free, hands it to the
 // spawn, and the daemon dies on EADDRINUSE before it can write daemon.json —
 // the silent "daemon.json timeout" (#574). Check host must equal bind host.
-export async function isPortFree(port: number, host = '127.0.0.1'): Promise<boolean> {
+//
+// #580 — and the answer must span both IP families. A daemon binds one host,
+// but clients reach it through `localhost`, which resolves `::1` ahead of
+// `127.0.0.1` on macOS and other dual-stack systems. A foreign listener on the
+// IPv6 side of a port we bind only on IPv4 swallows every `localhost` query
+// while a pure-IPv4 probe still reads the port as free, so allocation hands
+// over a port that's already shadowed. We probe the bind host's family AND its
+// cross-family loopback/wildcard sibling, and call the port taken if a holder
+// sits on either. A family the machine genuinely lacks (no IPv6 stack →
+// EADDRNOTAVAIL / EAFNOSUPPORT on the sibling) is not a holder and doesn't
+// block allocation; only an EADDRINUSE on the sibling does.
+type ProbeOutcome = 'free' | 'in-use' | 'unavailable'
+
+function probeBind(port: number, host: string): Promise<ProbeOutcome> {
   return new Promise((resolve) => {
     const server = net.createServer()
-    server.once('error', () => resolve(false))
-    server.once('listening', () => server.close(() => resolve(true)))
+    server.once('error', (err) => {
+      resolve((err as NodeJS.ErrnoException).code === 'EADDRINUSE' ? 'in-use' : 'unavailable')
+    })
+    server.once('listening', () => server.close(() => resolve('free')))
     server.listen(port, host)
   })
+}
+
+// The cross-family sibling to also probe for a shadowing holder. Loopback and
+// wildcard are the only hosts that have a meaningful sibling; a specific IP is
+// probed on its own.
+function crossFamilyHost(host: string): string | null {
+  switch (host) {
+    case '127.0.0.1':
+    case 'localhost':
+      return '::1'
+    case '::1':
+      return '127.0.0.1'
+    case '0.0.0.0':
+      return '::'
+    case '::':
+      return '0.0.0.0'
+    default:
+      return null
+  }
+}
+
+export async function isPortFree(port: number, host = '127.0.0.1'): Promise<boolean> {
+  // Primary interface: any failure (in-use or otherwise) means we can't bind
+  // it, so the port isn't usable — preserve the pre-#580 "any error → false".
+  if ((await probeBind(port, host)) !== 'free') return false
+  // Cross-family sibling: only a live holder (EADDRINUSE) counts. A missing
+  // family answers 'unavailable' and is not a shadow.
+  const sibling = crossFamilyHost(host)
+  if (sibling && (await probeBind(port, sibling)) === 'in-use') return false
+  return true
 }
 
 export async function probePortsFree(): Promise<

@@ -26,7 +26,14 @@
  *  - Auto-restart on crash. PID file is the supervisor handoff.
  */
 
-import { promises as fs, watch, type FSWatcher } from 'node:fs'
+import {
+  promises as fs,
+  watch,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+  type FSWatcher,
+} from 'node:fs'
 import path from 'node:path'
 import { createRequire } from 'node:module'
 import type { FastifyInstance } from 'fastify'
@@ -189,6 +196,31 @@ async function clearDaemonRecord(record: DaemonRecord, home?: string): Promise<v
   }
 }
 
+// Reconcile a daemon's self-description synchronously on an unsupervised exit
+// (project-daemon contract §2). The graceful `stop()` path already marks the
+// record stopped and clears the discovery copy; this is the backstop for a
+// crash or a fatal signal, where there's no chance to await async fs. A
+// process-exit handler runs synchronously, so we mark the neat-out/ record
+// `stopped` (tmp + renameSync keeps it atomic) and remove the discovery copy
+// with sync calls. Best-effort throughout: a missing or already-reconciled
+// file is fine, and a failure here must never throw out of an exit handler.
+export function reconcileDaemonRecordSync(record: DaemonRecord, home?: string): void {
+  try {
+    const stopped: DaemonRecord = { ...record, status: 'stopped' }
+    const target = daemonJsonPath(record.projectPath)
+    const tmp = `${target}.${process.pid}.tmp`
+    writeFileSync(tmp, JSON.stringify(stopped, null, 2) + '\n')
+    renameSync(tmp, target)
+  } catch {
+    // best-effort
+  }
+  try {
+    unlinkSync(daemonDiscoveryPath(record.project, home))
+  } catch {
+    // best-effort — already gone is fine.
+  }
+}
+
 export interface DaemonOptions {
   // Defaults to `~/.neat/`. Honors NEAT_HOME the same way registry.ts does.
   // Tests override via NEAT_HOME and don't pass this directly.
@@ -286,6 +318,10 @@ export interface DaemonHandle {
   // ADR-096 — the per-project self-description this daemon wrote, or null in
   // the legacy multi-project mode. Tests assert the persisted ports + status.
   daemonRecord: DaemonRecord | null
+  // The resolved NEAT_HOME this daemon discovers under. The entrypoint needs it
+  // to clear the right discovery copy when it reconciles daemon.json on an
+  // unsupervised exit (project-daemon contract §2).
+  neatHome: string
 }
 
 function neatHomeFor(opts: DaemonOptions): string {
@@ -1208,5 +1244,6 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<DaemonHandl
     bootstrap: tracker,
     initialBootstrap,
     daemonRecord,
+    neatHome: home,
   }
 }

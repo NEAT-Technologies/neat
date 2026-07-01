@@ -375,4 +375,47 @@ describe('buildOtelReceiver', () => {
     expect((res.headers['content-type'] ?? '').toString()).toMatch(/application\/json/)
     expect(JSON.parse(res.payload)).toEqual({ partialSuccess: {} })
   })
+
+  // #597 (a) — a fault while ingesting a span (a handler throw, a rejected
+  // promise) must be contained, not fatal. The drain loop catches it, the
+  // receiver keeps serving, and a subsequent good span still lands. Without
+  // this containment one bad span would silently dark the whole OBSERVED layer.
+  it('contains a throwing onSpan handler — the receiver stays up and later spans still land', async () => {
+    await app.close()
+    const seen: string[] = []
+    let first = true
+    app = await buildOtelReceiver({
+      onSpan: (s) => {
+        if (first) {
+          first = false
+          throw new Error('boom — simulated ingest fault')
+        }
+        seen.push(s.spanId)
+      },
+    })
+
+    // The span that throws — the receiver still replies 200 (OTLP non-blocking)
+    // and flushPending resolves rather than rejecting the drain cycle.
+    const bad = await app.inject({
+      method: 'POST',
+      url: '/v1/traces',
+      headers: { 'content-type': 'application/json' },
+      payload: SAMPLE_BODY,
+    })
+    expect(bad.statusCode).toBe(200)
+    await expect(
+      (app as unknown as { flushPending: () => Promise<void> }).flushPending(),
+    ).resolves.toBeUndefined()
+
+    // The daemon is still serving: a follow-up span processes normally.
+    const good = await app.inject({
+      method: 'POST',
+      url: '/v1/traces',
+      headers: { 'content-type': 'application/json' },
+      payload: SAMPLE_BODY,
+    })
+    expect(good.statusCode).toBe(200)
+    await (app as unknown as { flushPending: () => Promise<void> }).flushPending()
+    expect(seen.length).toBeGreaterThan(0)
+  })
 })

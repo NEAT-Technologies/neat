@@ -17,7 +17,7 @@
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import { createRequire } from 'node:module'
-import { startDaemon } from './daemon.js'
+import { startDaemon, reconcileDaemonRecordSync } from './daemon.js'
 import { BindAuthorityError } from './auth.js'
 import { listProjects, registryPath } from './registry.js'
 import { spawnWebUI, DEFAULT_WEB_PORT, type WebHandle } from './web-spawn.js'
@@ -102,6 +102,30 @@ async function cmdStart(): Promise<void> {
     }
     throw err
   }
+  // Fault containment (daemon contract — "an ingest fault never takes the
+  // daemon down"). A handler throw or a rejected promise that escaped the
+  // ingest drain loop must not silently dark the whole OBSERVED layer. Log it
+  // loud — error + stack, never silent — and keep serving. The bind paths stay
+  // fatal: those throw out of startDaemon above, before these handlers exist.
+  const logFault = (kind: string, err: unknown): void => {
+    const e = err as Error
+    console.error(
+      `neatd: ${kind} — daemon staying up. ${e?.stack ?? e?.message ?? String(err)}`,
+    )
+  }
+  process.on('uncaughtException', (err) => logFault('uncaught exception', err))
+  process.on('unhandledRejection', (reason) => logFault('unhandled rejection', reason))
+
+  // Reconcile daemon.json on any exit (project-daemon contract §2). The
+  // graceful `stop()` path does this asynchronously first; this synchronous
+  // backstop covers a crash or fatal signal so a dead daemon never leaves a
+  // `running` record pointing clients at a port nothing is listening on.
+  process.on('exit', () => {
+    if (handle.daemonRecord) {
+      reconcileDaemonRecordSync(handle.daemonRecord, handle.neatHome)
+    }
+  })
+
   console.log(`neatd: started, PID ${process.pid}, ${handle.slots.size} project(s)`)
   console.log(`neatd: registry at ${registryPath()}`)
   // ADR-063 — surface the bound addresses so the operator can sanity-check
