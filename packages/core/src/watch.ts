@@ -8,6 +8,7 @@ import { assertBindAuthority, readAuthEnv } from './auth.js'
 import { ensureCompatLoaded } from './compat.js'
 import { discoverServices, addServiceNodes } from './extract/services.js'
 import { addServiceAliases } from './extract/aliases.js'
+import { addFiles } from './extract/files.js'
 import { addImports } from './extract/imports.js'
 import { addDatabasesAndCompat } from './extract/databases/index.js'
 import { addConfigNodes } from './extract/configs.js'
@@ -37,6 +38,7 @@ import { attachGraphToEventBus, emitNeatEvent } from './events.js'
 export type ExtractPhase =
   | 'services'
   | 'aliases'
+  | 'files'
   | 'imports'
   | 'databases'
   | 'configs'
@@ -46,6 +48,7 @@ export type ExtractPhase =
 const ALL_PHASES: ExtractPhase[] = [
   'services',
   'aliases',
+  'files',
   'imports',
   'databases',
   'configs',
@@ -63,10 +66,15 @@ const ALL_PHASES: ExtractPhase[] = [
 //   .env / *.env.* / prisma / knex / ormconfig → databases + configs
 //   docker-compose / Dockerfile / *.tf / k8s yaml → infra + aliases
 //     (compose labels and Dockerfile labels feed alias discovery)
-//   *.js / *.ts / *.tsx / *.py / *.jsx / *.mjs / *.cjs → imports + calls
+//   *.js / *.ts / *.tsx / *.py / *.jsx / *.mjs / *.cjs → files + imports + calls
 //     (a source edit can shift both its IMPORTS and CALLS edges; the shared
 //     evidence.file retirement mechanism — static-extraction.md §Ghost-edge
-//     cleanup — drops the stale ones from either producer before re-running)
+//     cleanup — drops the stale ones from either producer before re-running.
+//     The `files` phase re-enumerates FileNodes first: retiring an edited
+//     file's edges also drops its CONTAINS edge — whose evidence.file is the
+//     file itself — and can orphan the FileNode, so Phase 1 has to rebuild it
+//     before imports/calls originate edges from it, or addImports emits from a
+//     node that no longer exists.)
 //   *.yaml / *.yml that isn't compose → databases + configs (ORM yaml fallbacks)
 export function classifyChange(relPath: string): Set<ExtractPhase> {
   const phases = new Set<ExtractPhase>()
@@ -108,6 +116,7 @@ export function classifyChange(relPath: string): Set<ExtractPhase> {
   }
 
   if (/\.(?:js|jsx|mjs|cjs|ts|tsx|py)$/.test(base)) {
+    phases.add('files')
     phases.add('imports')
     phases.add('calls')
   }
@@ -156,6 +165,17 @@ export async function runExtractPhases(
   }
   if (phases.has('aliases')) {
     await addServiceAliases(graph, scanPath, services)
+  }
+  // Phase 1 — file enumeration runs before imports/calls (file-awareness.md §1).
+  // Both of those producers originate edges from FileNodes; a re-extract driven
+  // by a source edit has already retired that file's CONTAINS edge (its
+  // evidence.file is the file itself) and may have swept the now-orphaned
+  // FileNode, so rebuilding it here is what keeps addImports from emitting an
+  // edge off a missing node. Idempotent — an unchanged tree is a no-op.
+  if (phases.has('files')) {
+    const r = await addFiles(graph, services)
+    nodesAdded += r.nodesAdded
+    edgesAdded += r.edgesAdded
   }
   if (phases.has('imports')) {
     const r = await addImports(graph, services)
