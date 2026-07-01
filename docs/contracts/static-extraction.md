@@ -96,7 +96,7 @@ Other extensions are skipped silently by `walkSourceFiles` per `IGNORED_DIRS` an
 | `databases/*`        | DatabaseNode + CONNECTS_TO                     | ❌ — #140      |
 | `configs.ts`         | ConfigNode + CONFIGURED_BY                     | ❌ — #140      |
 | `calls/{aws,grpc,http,kafka,redis,supabase}.ts` | CALLS / PUBLISHES_TO / CONSUMES_FROM | ✅          |
-| `infra/{docker-compose,dockerfile,k8s,terraform}.ts` | InfraNode + DEPENDS_ON / RUNS_ON | ❌ — #140 |
+| `infra/{docker-compose,dockerfile,k8s,terraform}.ts` | InfraNode + DEPENDS_ON / RUNS_ON / CONNECTS_TO | ✅ (evidence populated) |
 
 New producers under `calls/` for source-level DB connections (`new pg.Pool(...)`) and inter-service imports land under issue #141. They follow the same interface, same evidence shape, same idempotency.
 
@@ -169,6 +169,8 @@ A URL whose hostname is `medusa.cloud` does not match the service `@medusajs/med
 - An exact hostname match against a registered InfraNode hostname.
 
 `.includes(serviceName.slice(after-slash))` is forbidden. Common-word service names (`api`, `core`, `web`, `medusa`) make substring matching unconditionally wrong. Highest-signal fixtures: experiment rows 0001, 0002, 0003, 0012, 0013.
+
+An exact match that clears this filter — a scheme-qualified URL literal (`http://service-c:3102`, `//service-c/path`) whose hostname equals a registered service's name, dir, or alias — is a **declared HTTP dependency**: the source code names another in-mesh service's URL. It is graded `url-literal-service-target` and lands **at** the precision floor (ADR-066), so it enters the EXTRACTED layer and `missing-observed` can measure it. This is the case a declared-but-never-driven service (`service-c` present in source, never started) must surface through: without a floor-level EXTRACTED CALLS edge there is nothing for `missing-observed` to compare against, and the OBSERVED-thesis blind spot stays open (issue #592). The grade sits below `structural` / `verified-call-site` (0.85) because no call expression wraps the literal — a URL string can be a config default that never runs — and above `url-with-structural-support` (0.5) because scheme + exact host + a resolved registered target is tighter than a bare `redis://host` scheme read. `urlMatchesHost` (scheme + `://` or `//`, exact hostname, exact port when the token carries one) is what keeps this distinct from the sub-floor `hostname-shape-match` tier; a bare hostname token still grades 0.2 and stays out of the graph.
 
 ## Loud failure mode (ADR-065)
 

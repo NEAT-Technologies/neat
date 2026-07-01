@@ -65,4 +65,25 @@ describe('port allocator bind-host probe (#574)', () => {
     expect(resolveHost({}, true)).toBe('0.0.0.0')
     expect(resolveHost({}, false)).toBe('127.0.0.1')
   })
+
+  // #580 — a foreign listener on the IPv6 side of a port the daemon binds only
+  // on IPv4 (127.0.0.1) silently swallows every `localhost` query on macOS and
+  // other dual-stack systems, because `localhost` resolves `::1` first. A
+  // pure-IPv4 probe reads the port as free and allocation hands over a port
+  // that's already shadowed. The probe must see the IPv6 holder.
+  it('reads a loopback port as taken when only the IPv6 sibling (::1) holds it', async () => {
+    let server: net.Server
+    try {
+      server = await hold('::1')
+    } catch {
+      // A machine with no IPv6 loopback can't reproduce the shadow; there's
+      // nothing to guard against, so the scenario is vacuously satisfied.
+      return
+    }
+    held.push(server)
+    const port = portOf(server)
+    // The IPv4 probe on 127.0.0.1 would succeed on its own, but the cross-family
+    // sibling ::1 is held, so the port is shadowed and must read as taken.
+    expect(await isPortFree(port, '127.0.0.1')).toBe(false)
+  })
 })

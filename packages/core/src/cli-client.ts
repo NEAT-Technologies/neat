@@ -21,6 +21,7 @@ import type {
   GraphEdge,
   GraphNode,
   HypotheticalAction,
+  ObservedDependenciesResult,
   PolicyViolation,
   RootCauseResult,
   TransitiveDependenciesResult,
@@ -215,7 +216,7 @@ export async function runBlastRadius(
     const result = await client.get<BlastRadiusResult>(path)
     if (result.totalAffected === 0) {
       return {
-        summary: `${result.origin} has no downstream dependencies. Nothing else would break if it failed.`,
+        summary: `${result.origin} has no dependents. Nothing else would break if it failed.`,
       }
     }
     const sorted = [...result.affectedNodes].sort(
@@ -228,7 +229,7 @@ export async function runBlastRadius(
     )
     const provenances = [...new Set(sorted.map((n) => n.edgeProvenance))]
     return {
-      summary: `Blast radius for ${result.origin}: ${result.totalAffected} affected node${result.totalAffected === 1 ? '' : 's'} reachable downstream.`,
+      summary: `Blast radius for ${result.origin}: ${result.totalAffected} dependent node${result.totalAffected === 1 ? '' : 's'} would break if it changed.`,
       block: blockLines.join('\n'),
       confidence: Number.isFinite(minConfidence) ? minConfidence : undefined,
       provenance: provenances.length ? provenances : undefined,
@@ -300,9 +301,12 @@ export async function runDependencies(
   }
 }
 
-interface EdgesResponse {
-  inbound: GraphEdge[]
-  outbound: GraphEdge[]
+// Render one OBSERVED dependency. The edge is file-grained, so when its source
+// isn't the node we asked about (a service's owned file made the call) name the
+// originating file — that's the file-first answer, not a service rollup.
+function observedDepLine(nodeId: string, e: GraphEdge): string {
+  const via = e.source !== nodeId ? ` (via ${e.source})` : ''
+  return `  • ${e.target} — ${e.type}${via}${edgeMeta(e)}`
 }
 
 export async function runObservedDependencies(
@@ -310,20 +314,33 @@ export async function runObservedDependencies(
   input: DependenciesInput,
 ): Promise<VerbResult> {
   try {
-    const edges = await client.get<EdgesResponse>(
-      projectPath(input.project, `/graph/edges/${encodeURIComponent(input.nodeId)}`),
+    const result = await client.get<ObservedDependenciesResult>(
+      projectPath(
+        input.project,
+        `/graph/observed-dependencies/${encodeURIComponent(input.nodeId)}`,
+      ),
     )
-    const observed = edges.outbound.filter((e) => e.provenance === Provenance.OBSERVED)
-    if (observed.length === 0) {
-      const hasExtracted = edges.outbound.some((e) => e.provenance === Provenance.EXTRACTED)
-      const note = hasExtracted
+    if (result.dependencies.length === 0) {
+      // A pure receiver — hit at runtime but calling nothing downstream — is
+      // fully observed, so don't imply OTel is down. That note is honest only
+      // when nothing has been observed and static deps exist.
+      if (result.observed) {
+        return {
+          summary:
+            `${input.nodeId} makes no outbound runtime calls, but OTel has observed it ` +
+            `receiving traffic on ${result.inboundObservedCount} inbound call ` +
+            `path${result.inboundObservedCount === 1 ? '' : 's'} — it's a pure receiver.`,
+          provenance: Provenance.OBSERVED,
+        }
+      }
+      const note = result.hasExtractedOutbound
         ? ' Static (EXTRACTED) dependencies exist but no runtime traffic has been seen — is OTel running?'
         : ''
       return { summary: `No OBSERVED dependencies for ${input.nodeId}.${note}` }
     }
-    const blockLines = observed.map((e) => `  • ${e.target} — ${e.type}${edgeMeta(e)}`)
+    const blockLines = result.dependencies.map((e) => observedDepLine(input.nodeId, e))
     return {
-      summary: `${input.nodeId} has ${observed.length} runtime dependenc${observed.length === 1 ? 'y' : 'ies'} confirmed by OTel.`,
+      summary: `${input.nodeId} has ${result.dependencies.length} runtime dependenc${result.dependencies.length === 1 ? 'y' : 'ies'} confirmed by OTel.`,
       block: blockLines.join('\n'),
       provenance: Provenance.OBSERVED,
     }

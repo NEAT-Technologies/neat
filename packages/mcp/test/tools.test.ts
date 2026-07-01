@@ -188,7 +188,7 @@ describe('getBlastRadius', () => {
     })
     const res = await getBlastRadius(client, { nodeId: 'service:service-a' })
     const text = res.content[0].text
-    expect(text).toContain('Blast radius for service:service-a: 2 affected nodes')
+    expect(text).toContain('Blast radius for service:service-a: 2 dependent nodes would break')
     // service-b at distance 1 should appear before payments-db at distance 2
     const lines = text.split('\n')
     const bIdx = lines.findIndex((l) => l.includes('service:service-b'))
@@ -216,7 +216,7 @@ describe('getBlastRadius', () => {
     expect(res.content[0].text).toContain('[STALE')
   })
 
-  it('handles a node with no downstream nodes', async () => {
+  it('handles a node with no dependents', async () => {
     const { client } = clientFor({
       '/graph/blast-radius/database:payments-db': {
         origin: 'database:payments-db',
@@ -225,7 +225,7 @@ describe('getBlastRadius', () => {
       },
     })
     const res = await getBlastRadius(client, { nodeId: 'database:payments-db' })
-    expect(res.content[0].text).toContain('no downstream dependencies')
+    expect(res.content[0].text).toContain('no dependents')
   })
 
   it('passes depth as a query parameter', async () => {
@@ -327,21 +327,14 @@ describe('getDependencies', () => {
 })
 
 describe('getObservedDependencies', () => {
-  it('filters to OBSERVED only and includes lastObserved + callCount', async () => {
-    const { client } = clientFor({
-      '/graph/edges/service:service-a': {
-        inbound: [],
-        outbound: [
+  it('reads /graph/observed-dependencies and reports the runtime deps', async () => {
+    const { client, capture } = clientFor({
+      '/graph/observed-dependencies/service:service-a': {
+        origin: 'service:service-a',
+        dependencies: [
           {
-            id: 'CALLS:service:service-a->service:service-b',
-            source: 'service:service-a',
-            target: 'service:service-b',
-            type: EdgeType.CALLS,
-            provenance: Provenance.EXTRACTED,
-          },
-          {
-            id: 'CALLS:OBSERVED:service:service-a->service:service-b',
-            source: 'service:service-a',
+            id: 'CALLS:OBSERVED:file:service-a:src/pay.ts->service:service-b',
+            source: 'file:service-a:src/pay.ts',
             target: 'service:service-b',
             type: EdgeType.CALLS,
             provenance: Provenance.OBSERVED,
@@ -350,33 +343,51 @@ describe('getObservedDependencies', () => {
             lastObserved: '2026-05-01T15:51:11.967Z',
           },
         ],
+        observed: true,
+        inboundObservedCount: 0,
+        hasExtractedOutbound: true,
       },
     })
     const res = await getObservedDependencies(client, { nodeId: 'service:service-a' })
     const text = res.content[0].text
+    expect(capture.paths[0]).toBe('/graph/observed-dependencies/service%3Aservice-a')
     expect(text).toContain('service:service-a has 1 runtime dependency confirmed by OTel')
     expect(text).toContain('service:service-b')
+    // The originating file is named so a service answer stays file-first.
+    expect(text).toContain('via file:service-a:src/pay.ts')
     expect(text).toContain('lastObserved=2026-05-01T15:51:11.967Z')
     expect(text).toMatch(/provenance: OBSERVED/)
   })
 
   it('explains the OTel-down case when only EXTRACTED edges exist', async () => {
     const { client } = clientFor({
-      '/graph/edges/service:service-a': {
-        inbound: [],
-        outbound: [
-          {
-            id: 'CALLS:service:service-a->service:service-b',
-            source: 'service:service-a',
-            target: 'service:service-b',
-            type: EdgeType.CALLS,
-            provenance: Provenance.EXTRACTED,
-          },
-        ],
+      '/graph/observed-dependencies/service:service-a': {
+        origin: 'service:service-a',
+        dependencies: [],
+        observed: false,
+        inboundObservedCount: 0,
+        hasExtractedOutbound: true,
       },
     })
     const res = await getObservedDependencies(client, { nodeId: 'service:service-a' })
     expect(res.content[0].text).toContain('OTel running')
+  })
+
+  it('calls a pure receiver a pure receiver, not an OTel-down case', async () => {
+    const { client } = clientFor({
+      '/graph/observed-dependencies/service:ledger': {
+        origin: 'service:ledger',
+        dependencies: [],
+        observed: true,
+        inboundObservedCount: 3,
+        hasExtractedOutbound: false,
+      },
+    })
+    const res = await getObservedDependencies(client, { nodeId: 'service:ledger' })
+    const text = res.content[0].text
+    expect(text).toContain('pure receiver')
+    expect(text).toContain('3 inbound call paths')
+    expect(text).not.toContain('OTel running')
   })
 })
 
@@ -645,7 +656,13 @@ describe('project routing', () => {
         totalAffected: 0,
         affectedNodes: [],
       },
-      '/projects/alpha/graph/edges/service:a': { inbound: [], outbound: [] },
+      '/projects/alpha/graph/observed-dependencies/service:a': {
+        origin: 'service:a',
+        dependencies: [],
+        observed: false,
+        inboundObservedCount: 0,
+        hasExtractedOutbound: false,
+      },
       '/projects/alpha/graph/dependencies/service:a?depth=3': {
         origin: 'service:a',
         depth: 3,

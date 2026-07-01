@@ -15,6 +15,7 @@ import type {
   GraphEdge,
   GraphNode,
   HypotheticalAction,
+  ObservedDependenciesResult,
   PolicyViolation,
   RootCauseResult,
   TransitiveDependenciesResult,
@@ -113,7 +114,7 @@ export async function getBlastRadius(
     const result = await client.get<BlastRadiusResult>(path)
     if (result.totalAffected === 0) {
       return formatEmptyResponse(
-        `${result.origin} has no downstream dependencies. Nothing else would break if it failed.`,
+        `${result.origin} has no dependents. Nothing else would break if it failed.`,
       )
     }
     const sorted = [...result.affectedNodes].sort(
@@ -129,7 +130,7 @@ export async function getBlastRadius(
     )
     const provenances = [...new Set(sorted.map((n) => n.edgeProvenance))]
     return formatToolResponse({
-      summary: `Blast radius for ${result.origin}: ${result.totalAffected} affected node${result.totalAffected === 1 ? '' : 's'} reachable downstream.`,
+      summary: `Blast radius for ${result.origin}: ${result.totalAffected} dependent node${result.totalAffected === 1 ? '' : 's'} would break if it changed.`,
       block: blockLines.join('\n'),
       confidence: Number.isFinite(minConfidence) ? minConfidence : undefined,
       provenance: provenances.length ? provenances : undefined,
@@ -140,11 +141,6 @@ export async function getBlastRadius(
 function formatBlastEntry(n: BlastRadiusAffectedNode): string {
   const tag = n.edgeProvenance === Provenance.STALE ? ' [STALE — last seen too long ago]' : ''
   return `  • ${n.nodeId} (distance ${n.distance}, ${n.edgeProvenance})${tag}`
-}
-
-interface EdgesResponse {
-  inbound: GraphEdge[]
-  outbound: GraphEdge[]
 }
 
 export interface DependenciesInput {
@@ -207,25 +203,46 @@ export async function getDependencies(
   }, `Node ${input.nodeId} not found in the graph.`)
 }
 
+// Render one OBSERVED dependency, file-grained. When the edge source isn't the
+// queried node — a service's owned file made the call — name that file, so the
+// answer stays file-first rather than a service rollup (file-awareness §3).
+function observedDepLine(nodeId: string, e: GraphEdge): string {
+  const via = e.source !== nodeId ? ` (via ${e.source})` : ''
+  return `  • ${e.target} — ${e.type}${via}${edgeMeta(e)}`
+}
+
 export async function getObservedDependencies(
   client: HttpClient,
   input: DependenciesInput,
 ): Promise<ToolResponse> {
   return withMissingNodeFallback(async () => {
-    const edges = await client.get<EdgesResponse>(
-      projectPath(input.project, `/graph/edges/${encodeURIComponent(input.nodeId)}`),
+    const result = await client.get<ObservedDependenciesResult>(
+      projectPath(
+        input.project,
+        `/graph/observed-dependencies/${encodeURIComponent(input.nodeId)}`,
+      ),
     )
-    const observed = edges.outbound.filter((e) => e.provenance === Provenance.OBSERVED)
-    if (observed.length === 0) {
-      const hasExtracted = edges.outbound.some((e) => e.provenance === Provenance.EXTRACTED)
-      const note = hasExtracted
+    if (result.dependencies.length === 0) {
+      // A pure receiver is fully observed — it just calls nothing downstream.
+      // Reporting "is OTel running?" at it would be wrong; that note is honest
+      // only when nothing has been observed at all and static deps exist.
+      if (result.observed) {
+        return formatToolResponse({
+          summary:
+            `${input.nodeId} makes no outbound runtime calls, but OTel has observed it ` +
+            `receiving traffic on ${result.inboundObservedCount} inbound call ` +
+            `path${result.inboundObservedCount === 1 ? '' : 's'} — it's a pure receiver.`,
+          provenance: Provenance.OBSERVED,
+        })
+      }
+      const note = result.hasExtractedOutbound
         ? ' Static (EXTRACTED) dependencies exist but no runtime traffic has been seen — is OTel running?'
         : ''
       return formatEmptyResponse(`No OBSERVED dependencies for ${input.nodeId}.${note}`)
     }
-    const blockLines = observed.map((e) => `  • ${e.target} — ${e.type}${edgeMeta(e)}`)
+    const blockLines = result.dependencies.map((e) => observedDepLine(input.nodeId, e))
     return formatToolResponse({
-      summary: `${input.nodeId} has ${observed.length} runtime dependenc${observed.length === 1 ? 'y' : 'ies'} confirmed by OTel.`,
+      summary: `${input.nodeId} has ${result.dependencies.length} runtime dependenc${result.dependencies.length === 1 ? 'y' : 'ies'} confirmed by OTel.`,
       block: blockLines.join('\n'),
       provenance: Provenance.OBSERVED,
     })

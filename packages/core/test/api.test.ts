@@ -97,6 +97,30 @@ describe('REST API (fastify.inject)', () => {
     expect(body.outbound.length).toBeGreaterThanOrEqual(1)
   })
 
+  it('GET /graph/observed-dependencies/:nodeId returns the observed-deps shape (issue #578/#593)', async () => {
+    const res = await app.inject({
+      method: 'GET',
+      url: '/graph/observed-dependencies/service:service-a',
+    })
+    expect(res.statusCode).toBe(200)
+    const body = res.json()
+    expect(body.origin).toBe('service:service-a')
+    // The demo graph is static-only, so there are no OBSERVED deps — but the
+    // EXTRACTED CALLS to service-b is present, so the "is OTel running?" note is
+    // the honest one here.
+    expect(body.dependencies).toEqual([])
+    expect(body.observed).toBe(false)
+    expect(body.hasExtractedOutbound).toBe(true)
+  })
+
+  it('GET /graph/observed-dependencies/:nodeId returns 404 for an unknown node', async () => {
+    const res = await app.inject({
+      method: 'GET',
+      url: '/graph/observed-dependencies/nope',
+    })
+    expect(res.statusCode).toBe(404)
+  })
+
   it('GET /incidents returns a wrapped empty list when no log is configured', async () => {
     const res = await app.inject({ method: 'GET', url: '/incidents' })
     expect(res.statusCode).toBe(200)
@@ -110,6 +134,21 @@ describe('REST API (fastify.inject)', () => {
     })
     expect(res.statusCode).toBe(200)
     expect(res.json()).toEqual({ count: 0, total: 0, events: [] })
+  })
+
+  it('GET /graph/incident-history/:nodeId mirrors /incidents/:nodeId (issue #593)', async () => {
+    const alias = await app.inject({
+      method: 'GET',
+      url: '/graph/incident-history/service:service-b',
+    })
+    expect(alias.statusCode).toBe(200)
+    expect(alias.json()).toEqual({ count: 0, total: 0, events: [] })
+
+    const unknown = await app.inject({
+      method: 'GET',
+      url: '/graph/incident-history/nope',
+    })
+    expect(unknown.statusCode).toBe(404)
   })
 
   it('GET /search?q=service-b finds the matching node', async () => {
@@ -186,29 +225,27 @@ describe('REST API (fastify.inject)', () => {
     expect(res.statusCode).toBe(404)
   })
 
-  it('GET /graph/blast-radius/:nodeId returns downstream nodes with distances', async () => {
+  it('GET /graph/blast-radius/:nodeId returns the dependents of a sink with distances', async () => {
+    // Blast radius walks inbound — "what breaks if this changes?" — so a sink
+    // like the database returns the things that depend on it, not the empty
+    // list an outbound walk gives for a node with no dependencies of its own.
+    // The chain runs back up the dependencies: db-config.yaml connects to
+    // payments-db (distance 1), service-b owns that config via CONTAINS
+    // (distance 2), service-a's index.js calls service-b (distance 3), and
+    // service-a owns index.js (distance 4).
     const res = await app.inject({
       method: 'GET',
-      url: '/graph/blast-radius/service:service-a',
+      url: '/graph/blast-radius/database:payments-db',
     })
     expect(res.statusCode).toBe(200)
     const body = res.json()
-    expect(body.origin).toBe('service:service-a')
-    // File-first — databases/dockerfile/configs extractors now all anchor edges
-    // on FileNodes. Phase 1 file enumeration (ADR-092, file-awareness.md §1)
-    // gives every source file a FileNode unconditionally, so service-a CONTAINS
-    // three files at distance 1 (index.js, Dockerfile, and otel.js). The
-    // NEAT-authored `.env.neat` is excluded from extraction (self-pollution),
-    // so it never lands as a FileNode/ConfigNode. infra:container-image is at
-    // distance 2 (via Dockerfile FileNode); service-b at distance 2 (via
-    // index.js); service-b's files (db-config.yaml, Dockerfile, index.js,
-    // otel.js) at distance 3; its ConfigNode and payments-db at distance 4.
-    expect(body.totalAffected).toBe(11)
-    // path + confidence land per ADR-038 §affectedNodes payload. Property-style
+    expect(body.origin).toBe('database:payments-db')
+    expect(body.totalAffected).toBe(4)
+    // path + confidence land per §affectedNodes payload. Property-style
     // assertions so this test doesn't pin every BFS path detail — the contract
     // tests in contracts.test.ts pin the per-node invariants tightly.
     for (const n of body.affectedNodes) {
-      expect(n.path[0]).toBe('service:service-a')
+      expect(n.path[0]).toBe('database:payments-db')
       expect(n.path[n.path.length - 1]).toBe(n.nodeId)
       expect(n.path.length).toBe(n.distance + 1)
       expect(n.confidence).toBeGreaterThan(0)
@@ -216,16 +253,9 @@ describe('REST API (fastify.inject)', () => {
     }
     const ids = body.affectedNodes.map((n: { nodeId: string }) => n.nodeId).sort()
     expect(ids).toEqual([
-      'config:service-b/db-config.yaml',
-      'database:payments-db',
-      'file:service-a:Dockerfile',
       'file:service-a:index.js',
-      'file:service-a:otel.js',
-      'file:service-b:Dockerfile',
       'file:service-b:db-config.yaml',
-      'file:service-b:index.js',
-      'file:service-b:otel.js',
-      'infra:container-image:node:20-bookworm-slim',
+      'service:service-a',
       'service:service-b',
     ])
   })
@@ -255,21 +285,16 @@ describe('REST API (fastify.inject)', () => {
   it('GET /graph/blast-radius/:nodeId honours a custom depth', async () => {
     const res = await app.inject({
       method: 'GET',
-      url: '/graph/blast-radius/service:service-a?depth=1',
+      url: '/graph/blast-radius/database:payments-db?depth=1',
     })
     expect(res.statusCode).toBe(200)
     const body = res.json()
-    // File-first — at distance 1 service-a reaches its own FileNodes via
-    // CONTAINS (Dockerfile, index.js, and otel.js — every source file gets a
-    // FileNode unconditionally per Phase 1 file enumeration, ADR-092,
-    // file-awareness.md §1). The NEAT-authored `.env.neat` is excluded from
-    // extraction (self-pollution), so it isn't among them. The container-image
-    // and service-b both sit at distance 2, so depth=1 doesn't reach them.
-    expect(body.totalAffected).toBe(3)
+    // Depth 1 from the db reaches only its direct dependent — the config file
+    // that connects to it. service-b, which owns that file, sits at distance 2
+    // and so falls outside the depth-1 cutoff.
+    expect(body.totalAffected).toBe(1)
     expect(body.affectedNodes.map((n: { nodeId: string }) => n.nodeId).sort()).toEqual([
-      'file:service-a:Dockerfile',
-      'file:service-a:index.js',
-      'file:service-a:otel.js',
+      'file:service-b:db-config.yaml',
     ])
   })
 
