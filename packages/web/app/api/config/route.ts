@@ -1,5 +1,12 @@
 import { discoverProfiles, proxyGet } from '../../../lib/proxy'
 
+// This route resolves a live daemon by reading the discovery directory, so it
+// must never be served from a build-time cache. It already reads `request.url`,
+// which marks it dynamic today, but the dependency is on runtime state rather
+// than the URL — pin it explicitly so a future refactor that stops touching the
+// URL can't silently make it cacheable.
+export const dynamic = 'force-dynamic'
+
 // ADR-073 §3 amendment — `/api/config` is the daemon's auth-mode negotiation
 // endpoint. Always unauthenticated, returns `{ publicRead, authProxy }`. Under
 // ADR-101 there is no single core URL, so we resolve the daemon the same way

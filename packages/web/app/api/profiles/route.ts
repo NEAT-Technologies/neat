@@ -1,6 +1,14 @@
 import { discoverProfiles, DEMO } from '../../../lib/proxy'
 import { FIXTURE_PROFILES } from '../../../lib/fixtures'
 
+// This handler reads runtime state (the `~/.neat/daemons/*.json` discovery
+// directory) but takes no `request`, so nothing tells Next.js it depends on
+// live state. Left unpinned it gets statically prerendered at build time and
+// then serves whatever the build machine discovered — an empty list — forever,
+// with `x-nextjs-cache: HIT` even against a running daemon. Force it dynamic so
+// every request re-enumerates the discovery directory.
+export const dynamic = 'force-dynamic'
+
 // ADR-101 — the daemon-discovery enumerator (was `/api/projects`). Enumerates
 // `~/.neat/daemons/*.json` → one profile per per-project daemon
 // (`{ project, endpoint, status }`). This is the only local↔hosted swap point:
