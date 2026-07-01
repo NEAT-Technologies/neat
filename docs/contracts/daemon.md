@@ -94,9 +94,13 @@ Per-project recovery never affects other slots. The recovery attempt runs the sa
 - OTel ingest overwhelmed → backpressure via the queue (ADR-033 #1); spans drop, never block.
 - Span arrives for a broken project, recovery still fails → drop with a rate-limited warning (1 line per project per 60s) carrying the broken-state reason and the `neatd reload` hint. Never silent.
 
-## No automatic restart on crash
+## Fault containment — an ingest fault never takes the daemon down
 
-PID at `~/.neat/neatd.pid` for external supervisors. MVP does not respawn itself.
+A fault while ingesting a span — a handler throw, a rejected promise that escaped the drain loop — is contained, not fatal. The daemon process installs `unhandledRejection` and `uncaughtException` handlers that log the fault and keep serving; one bad span (or one bug in the ingest path) must not silently dark the whole OBSERVED layer for every project. This is the per-project-isolation guarantee extended to the process boundary: a single ingest fault is the smallest possible blast radius, never the death of the daemon. The bind-failure paths stay fatal exactly as before — a daemon that cannot bind its listeners is not serving anything and must exit loud.
+
+## Crash safety and self-description reconciliation
+
+PID at `~/.neat/neatd.pid` for external supervisors. The daemon does not respawn itself; supervision is the supervisor's job. It does, however, reconcile its own self-description on exit — graceful *or* otherwise. A daemon that goes down for any reason marks its `neat-out/daemon.json` `status: 'stopped'` and clears its machine-wide discovery copy synchronously on process exit, so a dead daemon never leaves a `running` record pointing clients at a port nothing is listening on. The graceful `stop()` path does this first; the process-exit handler is the backstop for the unsupervised case.
 
 ## Self-hosting gate stays closed
 
