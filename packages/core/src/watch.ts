@@ -8,6 +8,7 @@ import { assertBindAuthority, readAuthEnv } from './auth.js'
 import { ensureCompatLoaded } from './compat.js'
 import { discoverServices, addServiceNodes } from './extract/services.js'
 import { addServiceAliases } from './extract/aliases.js'
+import { addFiles } from './extract/files.js'
 import { addImports } from './extract/imports.js'
 import { addDatabasesAndCompat } from './extract/databases/index.js'
 import { addConfigNodes } from './extract/configs.js'
@@ -26,7 +27,14 @@ import {
   PolicyViolationsLog,
 } from './policy.js'
 import type { Policy } from '@neat.is/types'
-import { buildOtelReceiver } from './otel.js'
+import { buildOtelReceiver, listenSteppingOtlp } from './otel.js'
+import {
+  clearDaemonRecord,
+  portFromListenAddress,
+  resolveNeatVersion,
+  writeDaemonRecord,
+  type DaemonRecord,
+} from './daemon.js'
 import { startOtelGrpcReceiver } from './otel-grpc.js'
 import { loadGraphFromDisk, startPersistLoop } from './persist.js'
 import { buildSearchIndex, type SearchIndex } from './search.js'
@@ -37,6 +45,7 @@ import { attachGraphToEventBus, emitNeatEvent } from './events.js'
 export type ExtractPhase =
   | 'services'
   | 'aliases'
+  | 'files'
   | 'imports'
   | 'databases'
   | 'configs'
@@ -46,6 +55,7 @@ export type ExtractPhase =
 const ALL_PHASES: ExtractPhase[] = [
   'services',
   'aliases',
+  'files',
   'imports',
   'databases',
   'configs',
@@ -63,10 +73,15 @@ const ALL_PHASES: ExtractPhase[] = [
 //   .env / *.env.* / prisma / knex / ormconfig → databases + configs
 //   docker-compose / Dockerfile / *.tf / k8s yaml → infra + aliases
 //     (compose labels and Dockerfile labels feed alias discovery)
-//   *.js / *.ts / *.tsx / *.py / *.jsx / *.mjs / *.cjs → imports + calls
+//   *.js / *.ts / *.tsx / *.py / *.jsx / *.mjs / *.cjs → files + imports + calls
 //     (a source edit can shift both its IMPORTS and CALLS edges; the shared
 //     evidence.file retirement mechanism — static-extraction.md §Ghost-edge
-//     cleanup — drops the stale ones from either producer before re-running)
+//     cleanup — drops the stale ones from either producer before re-running.
+//     The `files` phase re-enumerates FileNodes first: retiring an edited
+//     file's edges also drops its CONTAINS edge — whose evidence.file is the
+//     file itself — and can orphan the FileNode, so Phase 1 has to rebuild it
+//     before imports/calls originate edges from it, or addImports emits from a
+//     node that no longer exists.)
 //   *.yaml / *.yml that isn't compose → databases + configs (ORM yaml fallbacks)
 export function classifyChange(relPath: string): Set<ExtractPhase> {
   const phases = new Set<ExtractPhase>()
@@ -108,6 +123,7 @@ export function classifyChange(relPath: string): Set<ExtractPhase> {
   }
 
   if (/\.(?:js|jsx|mjs|cjs|ts|tsx|py)$/.test(base)) {
+    phases.add('files')
     phases.add('imports')
     phases.add('calls')
   }
@@ -157,6 +173,17 @@ export async function runExtractPhases(
   if (phases.has('aliases')) {
     await addServiceAliases(graph, scanPath, services)
   }
+  // Phase 1 — file enumeration runs before imports/calls (file-awareness.md §1).
+  // Both of those producers originate edges from FileNodes; a re-extract driven
+  // by a source edit has already retired that file's CONTAINS edge (its
+  // evidence.file is the file itself) and may have swept the now-orphaned
+  // FileNode, so rebuilding it here is what keeps addImports from emitting an
+  // edge off a missing node. Idempotent — an unchanged tree is a no-op.
+  if (phases.has('files')) {
+    const r = await addFiles(graph, services)
+    nodesAdded += r.nodesAdded
+    edgesAdded += r.edgesAdded
+  }
   if (phases.has('imports')) {
     const r = await addImports(graph, services)
     nodesAdded += r.nodesAdded
@@ -192,6 +219,12 @@ export async function runExtractPhases(
     durationMs: Date.now() - started,
   }
 }
+
+// The canonical dashboard port recorded in daemon.json. `neat watch` binds no
+// dashboard of its own, but the DaemonRecord shape requires a web port; only
+// ports.otlp is load-bearing for the OBSERVED endpoint resolution this record
+// exists to serve. Mirrors DEFAULT_WEB_PORT in web-spawn.ts.
+const DEFAULT_WATCH_WEB_PORT = 6328
 
 export interface WatchOptions {
   scanPath: string
@@ -436,7 +469,7 @@ export async function startWatch(
   })
 
   const api = await buildApi({ projects: registry })
-  await api.listen({ port, host })
+  const restAddress = await api.listen({ port, host })
   console.log(`neat-core listening on http://${host}:${port}`)
   console.log(`  scan path:     ${opts.scanPath} (watching for changes)`)
   console.log(`  snapshot path: ${opts.outPath}`)
@@ -455,10 +488,50 @@ export async function startWatch(
     writeErrorEventInline: false,
     onPolicyTrigger,
   })
-  const onErrorSpanSync = makeErrorSpanWriter(opts.errorsPath)
+  const onErrorSpanSync = makeErrorSpanWriter(opts.errorsPath, graph, opts.scanPath)
   const otelHttp = await buildOtelReceiver({ onSpan, onErrorSpanSync })
-  await otelHttp.listen({ port: otelPort, host })
-  console.log(`neat-core OTLP receiver on http://${host}:${otelPort}/v1/traces`)
+  // A held OTLP port steps to the next free one rather than crashing the watch
+  // process (daemon.md §Binding). The real bound port is what daemon.json
+  // records below, so the instrumented app's otel-init resolves the right one.
+  const otelAddress = await listenSteppingOtlp(otelHttp, otelPort, host)
+  const boundOtelPort = portFromListenAddress(otelAddress, otelPort)
+  console.log(`neat-core OTLP receiver on ${otelAddress}/v1/traces`)
+
+  // Self-description (project-daemon §2). `neat watch` is a per-project daemon
+  // in the dev loop: the generated otel-init resolves its OTLP endpoint from
+  // `<project>/neat-out/daemon.json` `ports.otlp`, so an app instrumented
+  // against a watch bound to a non-default (or stepped) OTLP port would fall
+  // back to `:4318` and dark OBSERVED without this record.
+  const boundRestPort = portFromListenAddress(restAddress, port)
+  const daemonRecord: DaemonRecord = {
+    project: projectName,
+    projectPath: opts.scanPath,
+    pid: process.pid,
+    status: 'running',
+    ports: {
+      rest: boundRestPort,
+      otlp: boundOtelPort,
+      // watch serves no dashboard of its own; record the canonical web port so
+      // the record shape is valid. Only ports.otlp is load-bearing here.
+      web: DEFAULT_WATCH_WEB_PORT,
+    },
+    startedAt: new Date().toISOString(),
+    neatVersion: resolveNeatVersion(),
+  }
+  try {
+    await writeDaemonRecord(daemonRecord)
+    console.log(
+      `neat watch: wrote daemon.json (REST ${boundRestPort} / OTLP ${boundOtelPort})`,
+    )
+  } catch (err) {
+    // The record is load-bearing for the OBSERVED layer; without it the app
+    // silently falls back to :4318. Fail loud rather than run half-dark.
+    await api.close().catch(() => {})
+    await otelHttp.close().catch(() => {})
+    throw new Error(
+      `neat watch: failed to write daemon.json — ${(err as Error).message}`,
+    )
+  }
 
   let grpcReceiver: { stop: () => Promise<void> } | null = null
   if (opts.otelGrpc) {
@@ -604,6 +677,10 @@ export async function startWatch(
     await api.close()
     await otelHttp.close()
     if (grpcReceiver) await grpcReceiver.stop()
+    // Reconcile the self-description on shutdown (project-daemon §2) so a
+    // stopped watch never leaves a `running` record pointing an app at a
+    // receiver nothing is listening on.
+    await clearDaemonRecord(daemonRecord).catch(() => {})
   }
 
   return { api, stop }

@@ -5,6 +5,7 @@ import os from 'node:os'
 import { MultiDirectedGraph } from 'graphology'
 import {
   EdgeType,
+  type EdgeTypeValue,
   type ErrorEvent,
   fileId,
   type GraphEdge,
@@ -25,6 +26,7 @@ import {
   thresholdForEdgeType,
   type IngestContext,
 } from '../src/ingest.js'
+import { getRootCause } from '../src/traverse.js'
 import type { ParsedSpan } from '../src/otel.js'
 import type { NeatGraph } from '../src/graph.js'
 
@@ -367,6 +369,85 @@ describe('handleSpan', () => {
       traceId: 'trace-1',
       spanId: 'span-b',
     } as ErrorEvent)
+  })
+
+  it('collapses one failure recorded from two spans of a trace to one incident (#624)', async () => {
+    // A failed request: the DB driver throws (recorded from the db child span)
+    // and the HTTP server span echoes it as a synthesized "500 on ...". Both
+    // land on the same service in the same trace — two lines on disk, but one
+    // failed request, so the surface must count one and keep the real cause.
+    const httpAttrs = {
+      'http.response.status_code': 500,
+      'http.route': '/users/:id',
+      'http.request.method': 'GET',
+    }
+    const serverSpan: ParsedSpan = {
+      ...clientHttpSpan({ service: 'checkout', spanId: 'srv', kind: 2, statusCode: 2 }),
+      attributes: httpAttrs,
+    }
+    const dbChildSpan: ParsedSpan = dbSpan({
+      service: 'checkout',
+      spanId: 'db',
+      parentSpanId: 'srv',
+      statusCode: 2,
+      exception: { type: 'Error', message: 'SASL: SCRAM-SERVER-FIRST-MESSAGE failed' },
+      attributes: { 'db.system': 'postgresql', 'server.address': 'payments-db' },
+    })
+
+    const ev1 = buildErrorEventForReceiver(serverSpan)!
+    const ev2 = buildErrorEventForReceiver(dbChildSpan)!
+    expect(ev1.errorMessage).toBe('500 on GET /users/:id')
+    expect(ev1.affectedNode).toBe(ev2.affectedNode) // both attribute to service:checkout
+    await fs.writeFile(ctx.errorsPath, JSON.stringify(ev1) + '\n' + JSON.stringify(ev2) + '\n')
+
+    const events = await readErrorEvents(ctx.errorsPath)
+    expect(events).toHaveLength(1)
+    // The synthesized HTTP echo is dropped; the real exception survives.
+    expect(events[0]!.errorMessage).toContain('SCRAM')
+  })
+
+  it('keeps a lone synthesized 5xx incident when nothing deeper explains it (#624)', async () => {
+    // A clean 500 with no exception anywhere in the trace is still a real
+    // incident — the collapse only drops the echo when a real failure shares
+    // its trace and node.
+    const serverSpan: ParsedSpan = {
+      ...clientHttpSpan({ service: 'checkout', spanId: 'srv', kind: 2, statusCode: 2 }),
+      attributes: {
+        'http.response.status_code': 500,
+        'http.route': '/health',
+        'http.request.method': 'GET',
+      },
+    }
+    const ev = buildErrorEventForReceiver(serverSpan)!
+    await fs.writeFile(ctx.errorsPath, JSON.stringify(ev) + '\n')
+    const events = await readErrorEvents(ctx.errorsPath)
+    expect(events).toHaveLength(1)
+    expect(events[0]!.errorMessage).toBe('500 on GET /health')
+  })
+
+  it('reads the gRPC status for a non-HTTP failure instead of unknown error (#624)', () => {
+    const grpcSpan: ParsedSpan = {
+      ...clientHttpSpan({ service: 'checkout', spanId: 'rpc', kind: 3, statusCode: 2 }),
+      name: 'pay.Payments/Charge',
+      attributes: {
+        'rpc.system': 'grpc',
+        'rpc.grpc.status_code': 14,
+        'rpc.grpc.status_message': 'upstream connect error',
+        'server.address': 'payments',
+      },
+    }
+    const ev = buildErrorEventForReceiver(grpcSpan)!
+    expect(ev.errorMessage).toBe('gRPC UNAVAILABLE: upstream connect error')
+  })
+
+  it('reads a connection error for a non-HTTP failure instead of unknown error (#624)', () => {
+    const connSpan: ParsedSpan = {
+      ...clientHttpSpan({ service: 'checkout', spanId: 'conn', kind: 3, statusCode: 2 }),
+      name: 'GET',
+      attributes: { 'error.type': 'ECONNREFUSED', 'server.address': 'payments' },
+    }
+    const ev = buildErrorEventForReceiver(connSpan)!
+    expect(ev.errorMessage).toBe('ECONNREFUSED connecting to payments')
   })
 
   it('preserves span attributes on the ErrorEvent (ADR-068 follow-up)', async () => {
@@ -898,6 +979,76 @@ describe('stitchTrace', () => {
     ).toBe(true)
     expect(
       graph.hasEdge(`${EdgeType.CONNECTS_TO}:INFERRED:service:service-b->database:payments-db`),
+    ).toBe(true)
+  })
+
+  it('never mints INFERRED twins of structural edges, but still bridges an uninstrumented dependency', () => {
+    const graph = newGraph()
+    graph.addNode('service:api', {
+      id: 'service:api',
+      type: NodeType.ServiceNode,
+      name: 'api',
+      language: 'javascript',
+    })
+    graph.addNode('file:api/handler.ts', {
+      id: 'file:api/handler.ts',
+      type: NodeType.FileNode,
+      name: 'handler.ts',
+    })
+    graph.addNode('file:api/util.ts', {
+      id: 'file:api/util.ts',
+      type: NodeType.FileNode,
+      name: 'util.ts',
+    })
+    graph.addNode('config:api/.env', {
+      id: 'config:api/.env',
+      type: NodeType.ConfigNode,
+      name: '.env',
+    })
+    graph.addNode('database:orders-db', {
+      id: 'database:orders-db',
+      type: NodeType.DatabaseNode,
+      name: 'orders-db',
+    })
+
+    // Structural EXTRACTED edges out of the erroring service — must NOT be stitched.
+    const structural: [EdgeTypeValue, string, string][] = [
+      [EdgeType.CONTAINS, 'service:api', 'file:api/handler.ts'],
+      [EdgeType.IMPORTS, 'service:api', 'file:api/util.ts'],
+      [EdgeType.CONFIGURED_BY, 'service:api', 'config:api/.env'],
+    ]
+    for (const [type, source, target] of structural) {
+      const id = `${type}:${source}->${target}`
+      graph.addEdgeWithKey(id, source, target, {
+        id,
+        source,
+        target,
+        type,
+        provenance: Provenance.EXTRACTED,
+      })
+    }
+
+    // A genuine runtime dependency on an uninstrumented backend — SHOULD bridge.
+    graph.addEdgeWithKey(
+      'CONNECTS_TO:service:api->database:orders-db',
+      'service:api',
+      'database:orders-db',
+      {
+        id: 'CONNECTS_TO:service:api->database:orders-db',
+        source: 'service:api',
+        target: 'database:orders-db',
+        type: EdgeType.CONNECTS_TO,
+        provenance: Provenance.EXTRACTED,
+      },
+    )
+
+    stitchTrace(graph, 'service:api', '2026-05-01T00:00:00.000Z')
+
+    for (const [type, source, target] of structural) {
+      expect(graph.hasEdge(`${type}:INFERRED:${source}->${target}`)).toBe(false)
+    }
+    expect(
+      graph.hasEdge('CONNECTS_TO:INFERRED:service:api->database:orders-db'),
     ).toBe(true)
   })
 
@@ -1499,5 +1650,65 @@ describe('EXTRACTED and OBSERVED FileNodes fuse for the same source file', () =>
     // The honest runtime path stands; evidence is never fabricated onto the
     // wrong static node.
     expect(fileNodeIds.some((id) => id.endsWith('src/uninstrumented.ts'))).toBe(true)
+  })
+
+  // #619 — the fusion fix reconciled OBSERVED edge NODE ids onto the EXTRACTED
+  // path, but the incident `affectedNode` and the OBSERVED edge's own
+  // `evidence.file` still carried the raw deployed absolute path. On a
+  // serverless deploy (runtime rooted at /var/task, daemon rooted elsewhere)
+  // that split the incident off from the fused node and left the edge naming a
+  // path its node id didn't match. Both must reconcile onto the fused FileNode.
+  it('reconciles the incident affectedNode onto the fused FileNode so root-cause lands on it', async () => {
+    const staticFileId = fileId('service-a', 'src/client.ts')
+    ensureFileNode(ctx.graph, 'service-a', 'service:service-a', 'src/client.ts')
+
+    // A failing span for that file, carrying the deployed absolute path the
+    // SpanProcessor stamped. No scanPath is wired (the ad-hoc surface), and
+    // `/var/task` is the Lambda task root, not the daemon's checkout.
+    const span = clientHttpSpan({
+      statusCode: 2,
+      exception: { message: 'boom' },
+      attributes: {
+        'server.address': 'service-b',
+        'code.filepath': '/var/task/src/client.ts',
+        'code.lineno': 42,
+      },
+    })
+
+    // The receiver-path incident (production daemon path) attributes to the ONE
+    // fused node, not the phantom `file:service-a:var/task/src/client.ts`.
+    const ev = buildErrorEventForReceiver(span, ctx.graph)
+    expect(ev).not.toBeNull()
+    expect(ev!.affectedNode).toBe(staticFileId)
+    expect(ctx.graph.hasNode(ev!.affectedNode)).toBe(true)
+
+    // And root-cause on that fused node returns it — the query that came back
+    // empty before, because the incident pointed at a node absent from the graph.
+    const rc = getRootCause(ctx.graph, staticFileId, ev!, [ev!])
+    expect(rc).not.toBeNull()
+    expect(rc!.rootCauseNode).toBe(staticFileId)
+  })
+
+  it("reconciles the OBSERVED edge's evidence.file onto the fused path (node id and evidence agree)", async () => {
+    const staticFileId = fileId('service-a', 'src/client.ts')
+    ensureFileNode(ctx.graph, 'service-a', 'service:service-a', 'src/client.ts')
+
+    await handleSpan(
+      ctx,
+      clientHttpSpan({
+        attributes: {
+          'server.address': 'service-b',
+          'code.filepath': '/var/task/src/client.ts',
+          'code.lineno': 42,
+        },
+      }),
+    )
+
+    const observedCallsId = `${EdgeType.CALLS}:OBSERVED:${staticFileId}->service:service-b`
+    const edge = ctx.graph.getEdgeAttributes(observedCallsId) as GraphEdge
+    // The edge's node id already reconciled onto src/client.ts; its evidence must
+    // name the same fused path, not the raw /var/task deployed path.
+    expect(edge.evidence?.file).toBe('src/client.ts')
+    expect(edge.source).toBe(staticFileId)
   })
 })
