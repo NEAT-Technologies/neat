@@ -44,6 +44,26 @@ describe('infrastructure extraction', () => {
     expect(graph.hasEdge(edgeId)).toBe(true)
     const edge = graph.getEdgeAttributes(edgeId) as GraphEdge
     expect(edge.type).toBe('RUNS_ON')
+    // CMD line rides along as evidence so the entrypoint is queryable.
+    expect(edge.evidence?.snippet).toContain('node')
+  })
+
+  it('Dockerfile: EXPOSE emits a port InfraNode + CONNECTS_TO edge', async () => {
+    const graph = getGraph()
+    await extractFromDirectory(graph, path.join(FIXTURES, 'dockerfile'))
+
+    const portNodeId = 'infra:port:8080'
+    expect(graph.hasNode(portNodeId)).toBe(true)
+    const port = graph.getNodeAttributes(portNodeId) as InfraNode
+    expect(port.kind).toBe('port')
+
+    const fileNodeId = 'file:fixture-api:Dockerfile'
+    const portEdgeId = `CONNECTS_TO:${fileNodeId}->${portNodeId}`
+    expect(graph.hasEdge(portEdgeId)).toBe(true)
+    const portEdge = graph.getEdgeAttributes(portEdgeId) as GraphEdge
+    expect(portEdge.type).toBe('CONNECTS_TO')
+    expect(portEdge.provenance).toBe('EXTRACTED')
+    expect(portEdge.evidence?.file).toBe('api/Dockerfile')
   })
 
   it('terraform: catalogues aws_* resources as InfraNodes', async () => {
@@ -56,6 +76,34 @@ describe('infrastructure extraction', () => {
 
     const table = graph.getNodeAttributes('infra:aws_dynamodb_table:orders') as InfraNode
     expect(table.kind).toBe('aws_dynamodb_table')
+  })
+
+  it('terraform: a referenced RDS is a connected node; an unreferenced bucket stays orphan', async () => {
+    const graph = getGraph()
+    await extractFromDirectory(graph, path.join(FIXTURES, 'terraform-refs'))
+
+    // The RDS instance and its security group are both referenced by the app
+    // server, so DEPENDS_ON edges connect them into the topology.
+    const rds = 'infra:aws_db_instance:main'
+    const app = 'infra:aws_instance:app'
+    expect(graph.hasNode(rds)).toBe(true)
+    expect(graph.hasNode(app)).toBe(true)
+
+    const dependsRds = `DEPENDS_ON:${app}->${rds}`
+    expect(graph.hasEdge(dependsRds)).toBe(true)
+    const edge = graph.getEdgeAttributes(dependsRds) as GraphEdge
+    expect(edge.provenance).toBe('EXTRACTED')
+    expect(edge.evidence?.snippet).toBe('aws_db_instance.main')
+    expect(graph.hasEdge(`DEPENDS_ON:${app}->infra:aws_security_group:db`)).toBe(true)
+
+    // The RDS is in use — something points at it.
+    expect(graph.inDegree(rds)).toBeGreaterThan(0)
+
+    // The unreferenced bucket has no edges at all — declared-but-unused stays
+    // distinguishable from in-use.
+    const orphan = 'infra:aws_s3_bucket:orphan'
+    expect(graph.hasNode(orphan)).toBe(true)
+    expect(graph.degree(orphan)).toBe(0)
   })
 
   it('k8s: catalogues Service + Deployment manifests as InfraNodes', async () => {

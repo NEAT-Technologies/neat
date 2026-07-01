@@ -96,7 +96,7 @@ Other extensions are skipped silently by `walkSourceFiles` per `IGNORED_DIRS` an
 | `databases/*`        | DatabaseNode + CONNECTS_TO                     | ❌ — #140      |
 | `configs.ts`         | ConfigNode + CONFIGURED_BY                     | ❌ — #140      |
 | `calls/{aws,grpc,http,kafka,redis,supabase}.ts` | CALLS / PUBLISHES_TO / CONSUMES_FROM | ✅          |
-| `infra/{docker-compose,dockerfile,k8s,terraform}.ts` | InfraNode + DEPENDS_ON / RUNS_ON | ❌ — #140 |
+| `infra/{docker-compose,dockerfile,k8s,terraform}.ts` | InfraNode + DEPENDS_ON / RUNS_ON / CONNECTS_TO | ✅ (evidence populated) |
 
 New producers under `calls/` for source-level DB connections (`new pg.Pool(...)`) and inter-service imports land under issue #141. They follow the same interface, same evidence shape, same idempotency.
 

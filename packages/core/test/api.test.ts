@@ -203,7 +203,10 @@ describe('REST API (fastify.inject)', () => {
     // distance 2 (via Dockerfile FileNode); service-b at distance 2 (via
     // index.js); service-b's files (db-config.yaml, Dockerfile, index.js,
     // otel.js) at distance 3; its ConfigNode and payments-db at distance 4.
-    expect(body.totalAffected).toBe(11)
+    // Each Dockerfile's EXPOSE also hangs an infra:port node off its FileNode:
+    // port:3000 for service-a (distance 2) and port:3001 for service-b
+    // (distance 4).
+    expect(body.totalAffected).toBe(13)
     // path + confidence land per ADR-038 §affectedNodes payload. Property-style
     // assertions so this test doesn't pin every BFS path detail — the contract
     // tests in contracts.test.ts pin the per-node invariants tightly.
@@ -226,6 +229,8 @@ describe('REST API (fastify.inject)', () => {
       'file:service-b:index.js',
       'file:service-b:otel.js',
       'infra:container-image:node:20-bookworm-slim',
+      'infra:port:3000',
+      'infra:port:3001',
       'service:service-b',
     ])
   })
