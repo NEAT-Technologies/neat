@@ -95,8 +95,11 @@ PROVISION
 
 if command -v sshpass >/dev/null 2>&1; then
   say "provisioning $BASE_VM over SSH (Node $NODE_MAJOR + git + chromium, clearing NEAT state)"
+  # Pipe the provisioning script to the VM's shell over stdin so the host never
+  # expands the `$(...)` / `$PATH` inside it — the VM does. Interpolating the
+  # script into the ssh command string re-runs those on the host and corrupts it.
   sshpass -p "$VM_PASS" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-    "$VM_USER@$IP" "bash -lc '$REMOTE_PROVISION'"
+    "$VM_USER@$IP" 'bash -l' <<<"$REMOTE_PROVISION"
 else
   cat <<EOF
 
